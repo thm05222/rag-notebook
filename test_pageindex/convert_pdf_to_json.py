@@ -1,3 +1,4 @@
+# %%
 import os
 import json
 import sys
@@ -9,7 +10,6 @@ sys.path.insert(0, pageindex_dir)
 
 from pageindex.page_index import *
 from pageindex.utils import ConfigLoader
-CHATGPT_API_KEY = h
 def convert_pdf_to_json(pdf_path, output_path=None):
     """
     讀取 PDF 檔案並使用 PageIndex 轉換成 JSON
@@ -40,7 +40,7 @@ def convert_pdf_to_json(pdf_path, output_path=None):
     # 設定配置選項（可根據需要調整）
     user_opt = {
         'model': 'gpt-4o-2024-11-20',
-        'toc_check_page_num': 20,
+        'toc_check_page_num': 600,
         'max_page_num_each_node': 10,
         'max_token_num_each_node': 20000,
         'if_add_node_id': 'yes',
