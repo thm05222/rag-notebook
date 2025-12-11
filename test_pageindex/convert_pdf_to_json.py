@@ -10,6 +10,7 @@ sys.path.insert(0, pageindex_dir)
 
 from pageindex.page_index import *
 from pageindex.utils import ConfigLoader
+# %%
 def convert_pdf_to_json(pdf_path, output_path=None):
     """
     讀取 PDF 檔案並使用 PageIndex 轉換成 JSON
@@ -20,7 +21,7 @@ def convert_pdf_to_json(pdf_path, output_path=None):
     """
     # TODO: 填入 PDF 檔案路徑
     if not pdf_path:
-        pdf_path = r"E:\ftp_folder\圆柱绕流一：基础（翻译版） ((Zdravkovich M. M. ) 斯特兰科维奇) (Z-Library).pdf"  # 請在此填入 PDF 檔案路徑
+        pdf_path = r"E:\ftp_folder\Unleashing the Power of Multi-Task Learning A Comprehensive Survey Spanning Traditional, Deep, and Pretrained Foundation Model Eras.pdf"
     
     # 驗證 PDF 檔案
     if not pdf_path:

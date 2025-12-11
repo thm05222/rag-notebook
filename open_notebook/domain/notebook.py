@@ -74,6 +74,180 @@ class Asset(BaseModel):
     url: Optional[str] = None
 
 
+class SourceChunk(ObjectModel):
+    """Model for storing chunked content from sources."""
+    table_name: ClassVar[str] = "source_chunk"
+    source_id: str
+    chunk_index: int
+    content: str
+
+    @classmethod
+    async def create_batch(
+        cls, source_id: str, chunks: List[Tuple[int, str]]
+    ) -> List[str]:
+        """
+        Batch create chunks for a source.
+        
+        Args:
+            source_id: Source ID
+            chunks: List of (chunk_index, content) tuples
+            
+        Returns:
+            List of created chunk IDs
+        """
+        if not chunks:
+            return []
+        
+        try:
+            from open_notebook.database.repository import repo_insert
+            
+            # Prepare batch insert data
+            chunk_records = []
+            for chunk_index, content in chunks:
+                chunk_records.append({
+                    "source_id": ensure_record_id(source_id),
+                    "chunk_index": chunk_index,
+                    "content": content
+                })
+            
+            # Batch insert using repo_insert
+            result = await repo_insert(cls.table_name, chunk_records)
+            
+            # Extract IDs from result
+            chunk_ids = []
+            if result:
+                for row in result:
+                    if isinstance(row, dict) and "id" in row:
+                        chunk_ids.append(str(row["id"]))
+                    elif isinstance(row, list):
+                        for item in row:
+                            if isinstance(item, dict) and "id" in item:
+                                chunk_ids.append(str(item["id"]))
+            
+            logger.info(f"Created {len(chunk_ids)} chunks for source {source_id}")
+            return chunk_ids
+            
+        except Exception as e:
+            logger.error(f"Error creating chunks for source {source_id}: {str(e)}")
+            logger.exception(e)
+            raise DatabaseOperationError(e)
+    
+    @classmethod
+    async def delete_by_source_id(cls, source_id: str) -> int:
+        """
+        Delete all chunks for a source.
+        
+        Args:
+            source_id: Source ID
+            
+        Returns:
+            Number of deleted chunks
+        """
+        try:
+            # First, get count of chunks to delete
+            count_result = await repo_query(
+                "SELECT count() FROM source_chunk WHERE source_id = $source_id GROUP ALL",
+                {"source_id": ensure_record_id(source_id)}
+            )
+            
+            # Extract count
+            count = 0
+            if count_result and len(count_result) > 0:
+                if isinstance(count_result[0], dict) and "count" in count_result[0]:
+                    count = count_result[0]["count"]
+                elif isinstance(count_result[0], list) and len(count_result[0]) > 0:
+                    if isinstance(count_result[0][0], dict) and "count" in count_result[0][0]:
+                        count = count_result[0][0]["count"]
+            
+            # Delete chunks
+            if count > 0:
+                await repo_query(
+                    "DELETE source_chunk WHERE source_id = $source_id",
+                    {"source_id": ensure_record_id(source_id)}
+                )
+            
+            logger.info(f"Deleted {count} chunks for source {source_id}")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error deleting chunks for source {source_id}: {str(e)}")
+            logger.exception(e)
+            raise DatabaseOperationError(e)
+    
+    @classmethod
+    async def get_by_ids(cls, chunk_ids: List[str]) -> Dict[str, "SourceChunk"]:
+        """
+        Batch get chunks by IDs.
+        
+        Args:
+            chunk_ids: List of chunk IDs
+            
+        Returns:
+            Dictionary mapping chunk_id to SourceChunk instance
+        """
+        if not chunk_ids:
+            return {}
+        
+        try:
+            # Use SurrealDB's array-based query for better performance
+            # Convert chunk_ids to RecordIDs for query
+            record_ids = [ensure_record_id(chunk_id) for chunk_id in chunk_ids]
+            
+            # Build query using array contains or individual selects
+            # For better performance with many IDs, we'll query in batches
+            chunks_dict = {}
+            batch_size = 50  # Process in batches to avoid query size limits
+            
+            for i in range(0, len(record_ids), batch_size):
+                batch = record_ids[i:i + batch_size]
+                
+                # Build OR conditions for this batch
+                conditions = []
+                params = {}
+                for idx, record_id in enumerate(batch):
+                    param_key = f"id_{i + idx}"
+                    conditions.append(f"id = ${param_key}")
+                    params[param_key] = record_id
+                
+                query = f"SELECT * FROM source_chunk WHERE {' OR '.join(conditions)}"
+                result = await repo_query(query, params)
+                
+                # Build dictionary from batch results
+                if result:
+                    for row in result:
+                        if isinstance(row, dict) and "id" in row:
+                            chunk_id = str(row["id"])
+                            chunks_dict[chunk_id] = cls(**row)
+                        elif isinstance(row, list):
+                            for item in row:
+                                if isinstance(item, dict) and "id" in item:
+                                    chunk_id = str(item["id"])
+                                    chunks_dict[chunk_id] = cls(**item)
+            
+            logger.debug(f"Retrieved {len(chunks_dict)} chunks from {len(chunk_ids)} requested")
+            return chunks_dict
+            
+        except Exception as e:
+            logger.error(f"Error getting chunks by IDs: {str(e)}")
+            logger.exception(e)
+            raise DatabaseOperationError(e)
+    
+    async def get_source(self) -> "Source":
+        """Get the source this chunk belongs to."""
+        try:
+            src = await repo_query(
+                """
+            select source.* from $id fetch source
+            """,
+                {"id": ensure_record_id(self.source_id)},
+            )
+            return Source(**src[0]["source"])
+        except Exception as e:
+            logger.error(f"Error fetching source for chunk {self.id}: {str(e)}")
+            logger.exception(e)
+            raise DatabaseOperationError(e)
+
+
 class SourceEmbedding(ObjectModel):
     table_name: ClassVar[str] = "source_embedding"
     content: str
@@ -316,12 +490,19 @@ class Source(ObjectModel):
                 logger.error(f"Failed to connect to Qdrant: {e}")
                 raise ValueError(f"Failed to connect to Qdrant: {str(e)}. Please check Qdrant service status.")
 
-            # DELETE EXISTING EMBEDDINGS FIRST - Makes vectorize() idempotent
+            # DELETE EXISTING EMBEDDINGS AND CHUNKS FIRST - Makes vectorize() idempotent
             try:
+                # Delete from Qdrant
                 await qdrant_service.delete_source_embeddings(self.id)
                 logger.info(f"Deleted existing embeddings for source {self.id}")
+                
+                # Delete from SurrealDB (chunks are also deleted by EVENT, but we do it explicitly for idempotency)
+                from open_notebook.domain.notebook import SourceChunk
+                deleted_count = await SourceChunk.delete_by_source_id(self.id)
+                if deleted_count > 0:
+                    logger.info(f"Deleted {deleted_count} existing chunks for source {self.id}")
             except Exception as e:
-                logger.warning(f"Failed to delete existing embeddings (may not exist): {e}")
+                logger.warning(f"Failed to delete existing embeddings/chunks (may not exist): {e}")
                 # Continue anyway - this is not critical
 
             if not self.full_text:

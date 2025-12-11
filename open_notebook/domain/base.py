@@ -185,12 +185,24 @@ class ObjectModel(BaseModel):
         if self.id is None:
             raise InvalidInputError("Cannot delete object without an ID")
         try:
-            # Delete from Qdrant if this is a Source
+            # Delete from Qdrant and SurrealDB chunks if this is a Source
             if hasattr(self, 'table_name'):
                 if self.table_name == "source":
                     from open_notebook.services.qdrant_service import qdrant_service
+                    # Delete from Qdrant first
                     await qdrant_service.delete_source_embeddings(self.id)
                     logger.info(f"Deleted source embeddings from Qdrant for {self.id}")
+                    
+                    # Delete chunks from SurrealDB
+                    # Note: This is also handled by EVENT, but we do it explicitly for consistency
+                    try:
+                        from open_notebook.domain.notebook import SourceChunk
+                        deleted_count = await SourceChunk.delete_by_source_id(self.id)
+                        if deleted_count > 0:
+                            logger.info(f"Deleted {deleted_count} chunks from SurrealDB for {self.id}")
+                    except Exception as chunk_error:
+                        logger.warning(f"Failed to delete chunks (may be handled by EVENT): {chunk_error}")
+                        # Continue - EVENT will handle it
             
             logger.debug(f"Deleting record with id {self.id}")
             return await repo_delete(self.id)

@@ -2,16 +2,42 @@
 Qdrant service for vector storage and search operations
 """
 
+import asyncio
 import os
 import uuid
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchAny, MatchValue, PointStruct, VectorParams
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
 
+from open_notebook.config import QdrantConfig
 from open_notebook.domain.models import model_manager
+
+
+def async_wrap(func):
+    """Wrap synchronous Qdrant client methods to run in thread pool."""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+    return wrapper
+
+
+# Retry decorator for critical Qdrant operations
+qdrant_retry = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception)),
+    reraise=True,
+)
 
 
 class QdrantService:
@@ -23,30 +49,38 @@ class QdrantService:
         self._collections_created = False
         
     async def _ensure_client(self) -> QdrantClient:
-        """Ensure Qdrant client is initialized"""
+        """Ensure Qdrant client is initialized with configuration."""
         if self.client is None:
-            host = os.getenv("QDRANT_HOST", "qdrant")
-            port = int(os.getenv("QDRANT_PORT", "6333"))
-            api_key = os.getenv("QDRANT_API_KEY")
-            
-            logger.info(f"QdrantService: Initializing connection to {host}:{port} (API key: {'provided' if api_key else 'not provided'})")
+            logger.info(
+                f"QdrantService: Initializing connection to {QdrantConfig.host}:{QdrantConfig.port} "
+                f"(API key: {'provided' if QdrantConfig.api_key else 'not provided'}, "
+                f"gRPC: {QdrantConfig.prefer_grpc}, timeout: {QdrantConfig.timeout}s)"
+            )
             
             try:
+                # Initialize client with configuration
                 self.client = QdrantClient(
-                    host=host,
-                    port=port,
-                    api_key=api_key,
-                    timeout=30
+                    host=QdrantConfig.host,
+                    port=QdrantConfig.port,
+                    api_key=QdrantConfig.api_key,
+                    timeout=QdrantConfig.timeout,
+                    prefer_grpc=QdrantConfig.prefer_grpc,
                 )
-                # 測試連接
+                # Test connection in thread pool to avoid blocking
                 try:
-                    collections = self.client.get_collections()
-                    logger.info(f"QdrantService: Successfully connected to {host}:{port}, found {len(collections.collections)} collections")
+                    collections = await asyncio.to_thread(self.client.get_collections)
+                    logger.info(
+                        f"QdrantService: Successfully connected to {QdrantConfig.host}:{QdrantConfig.port}, "
+                        f"found {len(collections.collections)} collections"
+                    )
                 except Exception as test_error:
                     logger.warning(f"QdrantService: Connected but failed to test connection: {test_error}")
-                logger.info(f"Connected to Qdrant at {host}:{port}")
+                logger.info(f"Connected to Qdrant at {QdrantConfig.host}:{QdrantConfig.port}")
             except Exception as e:
-                logger.error(f"QdrantService: Failed to connect to Qdrant at {host}:{port}: {type(e).__name__}: {e}")
+                logger.error(
+                    f"QdrantService: Failed to connect to Qdrant at {QdrantConfig.host}:{QdrantConfig.port}: "
+                    f"{type(e).__name__}: {e}"
+                )
                 logger.exception(e)
                 raise
                 
@@ -60,7 +94,9 @@ class QdrantService:
             collection_name: Name of the collection to delete
         """
         client = await self._ensure_client()
-        try:
+        
+        @qdrant_retry
+        def _delete_collection():
             # Check if collection exists
             collections_info = client.get_collections()
             existing_collections = [c.name for c in collections_info.collections]
@@ -70,6 +106,9 @@ class QdrantService:
                 logger.info(f"Deleted collection: {collection_name}")
             else:
                 logger.debug(f"Collection {collection_name} does not exist, skipping deletion")
+        
+        try:
+            await asyncio.to_thread(_delete_collection)
         except Exception as e:
             logger.error(f"Failed to delete collection {collection_name}: {e}")
             raise
@@ -99,7 +138,10 @@ class QdrantService:
         # Check each collection for dimension mismatch
         for collection_name in collections_to_check:
             try:
-                collections_info = client.get_collections()
+                def _get_collections():
+                    return client.get_collections()
+                
+                collections_info = await asyncio.to_thread(_get_collections)
                 existing_collections = [c.name for c in collections_info.collections]
                 
                 if collection_name not in existing_collections:
@@ -107,7 +149,10 @@ class QdrantService:
                     continue
                 
                 # Collection exists, check dimension
-                collection_info = client.get_collection(collection_name)
+                def _get_collection():
+                    return client.get_collection(collection_name)
+                
+                collection_info = await asyncio.to_thread(_get_collection)
                 existing_dim = None
                 
                 if hasattr(collection_info, 'config') and hasattr(collection_info.config, 'params'):
@@ -172,23 +217,32 @@ class QdrantService:
         for collection_name, description in collections:
             try:
                 # Check if collection exists
-                collections_info = client.get_collections()
+                def _get_collections():
+                    return client.get_collections()
+                
+                collections_info = await asyncio.to_thread(_get_collections)
                 existing_collections = [c.name for c in collections_info.collections]
                 
                 if collection_name not in existing_collections:
                     # Collection doesn't exist, create it
-                    client.create_collection(
-                        collection_name=collection_name,
-                        vectors_config=VectorParams(
-                            size=self.vector_dim,
-                            distance=Distance.COSINE
+                    def _create_collection():
+                        client.create_collection(
+                            collection_name=collection_name,
+                            vectors_config=VectorParams(
+                                size=self.vector_dim,
+                                distance=Distance.COSINE
+                            )
                         )
-                    )
+                    
+                    await asyncio.to_thread(_create_collection)
                     logger.info(f"Created collection: {collection_name} with dimension {self.vector_dim}")
                 else:
                     # Collection exists, check if dimension matches
                     try:
-                        collection_info = client.get_collection(collection_name)
+                        def _get_collection():
+                            return client.get_collection(collection_name)
+                        
+                        collection_info = await asyncio.to_thread(_get_collection)
                         # Get vector dimension from collection config
                         # Qdrant collection config structure: config.params.vectors.size
                         existing_dim = None
@@ -249,39 +303,92 @@ class QdrantService:
         notebook_ids: List[str]
     ) -> None:
         """
-        Store source embeddings in Qdrant
+        Store source embeddings in Qdrant.
+        
+        New logic: Content is stored in SurrealDB source_chunk table,
+        Qdrant only stores chunk_id and vector.
         
         Args:
             source_id: Source ID
             embeddings_data: List of (order, embedding, content) tuples
             notebook_ids: List of notebook IDs this source belongs to
         """
+        from open_notebook.domain.notebook import SourceChunk
+        
+        # Step 1: Delete existing chunks for idempotency
+        try:
+            await SourceChunk.delete_by_source_id(source_id)
+            logger.debug(f"Deleted existing chunks for source {source_id} (idempotency)")
+        except Exception as e:
+            logger.warning(f"Failed to delete existing chunks (may not exist): {e}")
+            # Continue anyway - this is not critical
+        
         await self._ensure_collections()
         client = await self._ensure_client()
         
-        points = []
-        for order, embedding, content in embeddings_data:
-            point_id = str(uuid.uuid4())
-            point = PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
+        chunk_ids = []
+        try:
+            # Step 2: Store chunks in SurrealDB and get chunk IDs
+            chunks_data = [(order, content) for order, embedding, content in embeddings_data]
+            chunk_ids = await SourceChunk.create_batch(source_id, chunks_data)
+            
+            if len(chunk_ids) != len(embeddings_data):
+                raise ValueError(
+                    f"Mismatch: created {len(chunk_ids)} chunks but expected {len(embeddings_data)}"
+                )
+            
+            logger.info(f"Stored {len(chunk_ids)} chunks in SurrealDB for source {source_id}")
+            
+            # Step 3: Store embeddings in Qdrant with chunk_id (not content)
+            points = []
+            for idx, (order, embedding, content) in enumerate(embeddings_data):
+                point_id = str(uuid.uuid4())
+                chunk_id = chunk_ids[idx] if idx < len(chunk_ids) else None
+                
+                if not chunk_id:
+                    raise ValueError(f"Missing chunk_id for chunk {idx}")
+                
+                payload = {
                     "source_id": source_id,
+                    "chunk_id": chunk_id,
                     "order": order,
-                    "content": content,
                     "notebook_ids": notebook_ids
                 }
-            )
-            points.append(point)
-        
-        try:
-            client.upsert(
-                collection_name="source_embeddings",
-                points=points
-            )
-            logger.info(f"Stored {len(points)} embeddings for source {source_id}")
+                # Content is no longer stored in Qdrant payload
+                
+                point = PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload=payload
+                )
+                points.append(point)
+            
+            @qdrant_retry
+            def _upsert_points():
+                client.upsert(
+                    collection_name="source_embeddings",
+                    points=points
+                )
+            
+            await asyncio.to_thread(_upsert_points)
+            logger.info(f"Stored {len(points)} embeddings in Qdrant for source {source_id}")
+            
         except Exception as e:
             error_str = str(e)
+            
+            # Rollback: If Qdrant write failed, delete SurrealDB chunks
+            if chunk_ids:
+                logger.warning(
+                    f"Qdrant write failed for source {source_id}, "
+                    f"rolling back {len(chunk_ids)} chunks from SurrealDB"
+                )
+                try:
+                    await SourceChunk.delete_by_source_id(source_id)
+                    logger.info(f"Rolled back {len(chunk_ids)} chunks for source {source_id}")
+                except Exception as rollback_error:
+                    logger.error(f"Failed to rollback chunks: {rollback_error}")
+                    # Continue to raise original error
+            
             # Check for dimension mismatch error
             if "dimension" in error_str.lower() or "dim" in error_str.lower():
                 logger.error(f"Vector dimension mismatch when storing embeddings: {e}")
@@ -329,11 +436,14 @@ class QdrantService:
         payload = {
             "source_id": source_id,
             "insight_type": insight_type,
-            "content": content,
             "notebook_ids": notebook_ids
         }
         
-        # Add insight_id to payload if provided
+        # Only store content if configured to do so
+        if QdrantConfig.store_content_in_payload:
+            payload["content"] = content
+        
+        # Add insight_id to payload if provided (always needed for cleanup)
         if insight_id:
             payload["insight_id"] = insight_id
         
@@ -343,11 +453,15 @@ class QdrantService:
             payload=payload
         )
         
-        try:
+        @qdrant_retry
+        def _upsert_insight():
             client.upsert(
                 collection_name="source_insights",
                 points=[point]
             )
+        
+        try:
+            await asyncio.to_thread(_upsert_insight)
             logger.info(f"Stored insight for source {source_id}" + (f" (insight_id: {insight_id})" if insight_id else ""))
         except Exception as e:
             error_str = str(e)
@@ -381,7 +495,8 @@ class QdrantService:
         await self._ensure_collections()
         client = await self._ensure_client()
         
-        try:
+        @qdrant_retry
+        def _delete_embeddings():
             # Delete from source_embeddings collection
             client.delete(
                 collection_name="source_embeddings",
@@ -411,7 +526,9 @@ class QdrantService:
                     )
                 )
             )
-            
+        
+        try:
+            await asyncio.to_thread(_delete_embeddings)
             logger.info(f"Deleted all embeddings for source {source_id}")
         except Exception as e:
             logger.error(f"Failed to delete source embeddings: {e}")
@@ -427,7 +544,8 @@ class QdrantService:
         await self._ensure_collections()
         client = await self._ensure_client()
         
-        try:
+        @qdrant_retry
+        def _delete_insight():
             # Delete from source_insights collection based on insight_id in payload
             client.delete(
                 collection_name="source_insights",
@@ -442,6 +560,9 @@ class QdrantService:
                     )
                 )
             )
+        
+        try:
+            await asyncio.to_thread(_delete_insight)
             logger.info(f"Deleted insight {insight_id} from Qdrant")
         except Exception as e:
             logger.error(f"Failed to delete insight {insight_id} from Qdrant: {e}")
@@ -507,13 +628,17 @@ class QdrantService:
         if search_sources:
             try:
                 embed_search_start = time.time()
-                source_results = client.search(
-                    collection_name="source_embeddings",
-                    query_vector=query_vector,
-                    query_filter=query_filter,
-                    limit=limit,
-                    score_threshold=min_score
-                )
+                
+                def _search_embeddings():
+                    return client.search(
+                        collection_name="source_embeddings",
+                        query_vector=query_vector,
+                        query_filter=query_filter,
+                        limit=limit,
+                        score_threshold=min_score
+                    )
+                
+                source_results = await asyncio.to_thread(_search_embeddings)
                 embed_search_duration = time.time() - embed_search_start
                 logger.info(f"QdrantService.vector_search: Source embeddings search completed in {embed_search_duration:.2f}s, found {len(source_results)} results")
                 
@@ -522,12 +647,54 @@ class QdrantService:
                     scores = [r.score for r in source_results]
                     logger.info(f"QdrantService.vector_search: Source embeddings similarity scores - min={min(scores):.4f}, max={max(scores):.4f}, avg={sum(scores)/len(scores):.4f}")
                 
+                # Collect chunk_ids for batch query
+                chunk_ids = []
+                result_mappings = []  # Store mapping: (result_index, chunk_id or None)
+                
+                for idx, result in enumerate(source_results):
+                    chunk_id = result.payload.get("chunk_id")
+                    if chunk_id:
+                        chunk_ids.append(chunk_id)
+                        result_mappings.append((idx, chunk_id))
+                    else:
+                        # Backward compatibility: old format with content in payload
+                        result_mappings.append((idx, None))
+                
+                # Batch fetch content from SurrealDB
+                chunk_contents = {}
+                if chunk_ids:
+                    try:
+                        from open_notebook.domain.notebook import SourceChunk
+                        chunk_contents = await SourceChunk.get_by_ids(chunk_ids)
+                        logger.debug(
+                            f"QdrantService.vector_search: Retrieved {len(chunk_contents)}/{len(chunk_ids)} chunks from SurrealDB"
+                        )
+                    except Exception as fetch_error:
+                        logger.warning(
+                            f"QdrantService.vector_search: Failed to fetch chunks from SurrealDB: {fetch_error}"
+                        )
+                        # Continue with empty content
+                
+                # Build results with content from SurrealDB
                 for idx, result in enumerate(source_results):
                     try:
+                        chunk_id = result.payload.get("chunk_id")
+                        content = ""
+                        
+                        if chunk_id and chunk_id in chunk_contents:
+                            # New format: get content from SurrealDB
+                            content = chunk_contents[chunk_id].content
+                        elif result.payload.get("content"):
+                            # Backward compatibility: old format with content in payload
+                            content = result.payload.get("content", "")
+                            logger.debug(
+                                f"QdrantService.vector_search: Using legacy content from payload for result {idx}"
+                            )
+                        
                         result_dict = {
                             "id": result.payload.get("source_id", ""),
                             "title": result.payload.get("source_id", ""),  # Will be updated with actual title
-                            "content": result.payload.get("content", ""),
+                            "content": content,
                             "parent_id": result.payload.get("source_id", ""),
                             "similarity": result.score,
                             "type": "source_embedding"
@@ -542,204 +709,53 @@ class QdrantService:
                 logger.error(f"QdrantService.vector_search: Error searching source embeddings: {type(e).__name__}: {e}")
                 logger.exception(e)
         
-        # Search source insights
+        # Search source insights (Optimistic Read Strategy: no validation during search)
         if search_sources:
             try:
                 insight_search_start = time.time()
-                insight_results = client.search(
-                    collection_name="source_insights",
-                    query_vector=query_vector,
-                    query_filter=query_filter,
-                    limit=limit,
-                    score_threshold=min_score
-                )
+                
+                def _search_insights():
+                    return client.search(
+                        collection_name="source_insights",
+                        query_vector=query_vector,
+                        query_filter=query_filter,
+                        limit=limit,
+                        score_threshold=min_score
+                    )
+                
+                insight_results = await asyncio.to_thread(_search_insights)
                 insight_search_duration = time.time() - insight_search_start
-                logger.info(f"QdrantService.vector_search: Source insights search completed in {insight_search_duration:.2f}s, found {len(insight_results)} results")
-                
-                # 關鍵優化：批量驗證 insights
-                verification_start = time.time()
-                valid_insight_ids = set()
-                orphaned_insight_ids = []
-                insight_ids_to_verify = []  # 關鍵修復：初始化變量，避免 UnboundLocalError
-                
-                if insight_results:
-                    from open_notebook.database.repository import repo_query, ensure_record_id
-                    
-                    # 收集所有 insight_ids
-                    insight_ids_to_verify = [
-                        r.payload.get("insight_id") 
-                        for r in insight_results 
-                        if r.payload.get("insight_id")
-                    ]
-                    
-                    if insight_ids_to_verify:
-                        logger.info(f"QdrantService.vector_search: Verifying {len(insight_ids_to_verify)} insights using batch query...")
-                        
-                        try:
-                            # 批量查詢：一次性查詢所有 insight_ids
-                            # 使用 SurrealDB 的 array::any() 或 IN 語法
-                            # 注意：SurrealDB 不支持 SQL 的 IN，需要使用 array::any() 或 OR 條件
-                            # 為了性能，我們使用 array::any() 方法
-                            
-                            # 構建批量查詢：SELECT id FROM source_insight WHERE id IN [...]
-                            # SurrealDB 語法：使用 array::any() 或直接使用多個條件
-                            # 為了簡化，我們使用 array::any() 函數
-                            
-                            # 方法 1: 使用 array::any() (如果支持)
-                            # 方法 2: 使用 OR 條件（如果數量不多）
-                            # 方法 3: 分批次查詢（如果數量很多）
-                            
-                            batch_size = 50  # 每批最多 50 個，避免查詢過長
-                            all_valid_ids = []
-                            
-                            for batch_start in range(0, len(insight_ids_to_verify), batch_size):
-                                batch_ids = insight_ids_to_verify[batch_start:batch_start + batch_size]
-                                batch_num = (batch_start // batch_size) + 1
-                                total_batches = (len(insight_ids_to_verify) + batch_size - 1) // batch_size
-                                
-                                logger.info(f"QdrantService.vector_search: Verifying batch {batch_num}/{total_batches} ({len(batch_ids)} insights)")
-                                
-                                try:
-                                    # 構建批量查詢 - 使用 array::any() 函數
-                                    # SurrealDB 語法示例: SELECT id FROM source_insight WHERE array::any([$ids], function(item) { return item == id })
-                                    # 或者更簡單: 使用多個 OR 條件
-                                    
-                                    # 構建 OR 條件
-                                    conditions = []
-                                    params = {}
-                                    for idx, insight_id in enumerate(batch_ids):
-                                        param_key = f"id_{idx}"
-                                        conditions.append(f"id = ${param_key}")
-                                        params[param_key] = ensure_record_id(insight_id)
-                                    
-                                    query = f"SELECT id FROM source_insight WHERE {' OR '.join(conditions)}"
-                                    
-                                    batch_result = await repo_query(query, params)
-                                    
-                                    # 提取有效的 ID
-                                    batch_valid_ids = [
-                                        str(row.get("id")) 
-                                        for row in batch_result 
-                                        if row.get("id")
-                                    ]
-                                    all_valid_ids.extend(batch_valid_ids)
-                                    
-                                    logger.info(f"QdrantService.vector_search: Batch {batch_num}: {len(batch_valid_ids)}/{len(batch_ids)} valid")
-                                    
-                                except Exception as batch_error:
-                                    logger.warning(f"QdrantService.vector_search: Batch {batch_num} verification failed: {batch_error}")
-                                    # 如果批量查詢失敗，回退到逐個驗證這個批次
-                                    logger.warning(f"QdrantService.vector_search: Falling back to individual verification for batch {batch_num}")
-                                    for insight_id in batch_ids:
-                                        try:
-                                            from open_notebook.domain.notebook import SourceInsight
-                                            from open_notebook.exceptions import NotFoundError
-                                            insight = await SourceInsight.get(insight_id)
-                                            if insight:
-                                                all_valid_ids.append(insight_id)
-                                        except NotFoundError:
-                                            pass  # 稍後處理
-                                        except Exception:
-                                            # 驗證失敗時，假設有效（保守策略）
-                                            all_valid_ids.append(insight_id)
-                            
-                            valid_insight_ids = set(all_valid_ids)
-                            
-                            # 找出孤立的 insights（在 Qdrant 中但不在 SurrealDB 中）
-                            orphaned_insight_ids = [
-                                insight_id 
-                                for insight_id in insight_ids_to_verify 
-                                if insight_id not in valid_insight_ids
-                            ]
-                            
-                            # 批量刪除孤立的 insights
-                            if orphaned_insight_ids:
-                                logger.info(f"QdrantService.vector_search: Found {len(orphaned_insight_ids)} orphaned insights, cleaning up...")
-                                cleanup_start = time.time()
-                                cleanup_count = 0
-                                
-                                for insight_id in orphaned_insight_ids:
-                                    try:
-                                        await self.delete_source_insight(insight_id)
-                                        cleanup_count += 1
-                                    except Exception as cleanup_error:
-                                        logger.warning(f"QdrantService.vector_search: Failed to delete orphaned insight {insight_id}: {cleanup_error}")
-                                
-                                cleanup_duration = time.time() - cleanup_start
-                                logger.info(f"QdrantService.vector_search: Cleaned up {cleanup_count}/{len(orphaned_insight_ids)} orphaned insights in {cleanup_duration:.2f}s")
-                            
-                        except Exception as verification_error:
-                            logger.error(f"QdrantService.vector_search: Batch verification failed: {verification_error}")
-                            logger.exception(verification_error)
-                            # 如果批量驗證完全失敗，回退到逐個驗證
-                            logger.warning("QdrantService.vector_search: Falling back to individual verification")
-                            from open_notebook.domain.notebook import SourceInsight
-                            from open_notebook.exceptions import NotFoundError
-                            
-                            for insight_id in insight_ids_to_verify:
-                                try:
-                                    insight = await SourceInsight.get(insight_id)
-                                    if insight:
-                                        valid_insight_ids.add(insight_id)
-                                except NotFoundError:
-                                    orphaned_insight_ids.append(insight_id)
-                                    try:
-                                        await self.delete_source_insight(insight_id)
-                                    except Exception:
-                                        pass
-                                except Exception as e:
-                                    logger.warning(f"QdrantService.vector_search: Failed to verify insight {insight_id}: {e}")
-                                    # 驗證失敗時，假設有效（保守策略）
-                                    valid_insight_ids.add(insight_id)
-                
-                verification_duration = time.time() - verification_start
                 logger.info(
-                    f"QdrantService.vector_search: Insight verification completed in {verification_duration:.2f}s, "
-                    f"{len(valid_insight_ids)} valid, {len(orphaned_insight_ids)} orphaned out of {len(insight_ids_to_verify)} total"
+                    f"QdrantService.vector_search: Source insights search completed in {insight_search_duration:.2f}s, "
+                    f"found {len(insight_results)} results"
                 )
                 
-                # 關鍵修復：記錄驗證後的結果統計
-                if orphaned_insight_ids:
-                    logger.warning(f"QdrantService.vector_search: {len(orphaned_insight_ids)} orphaned insights were filtered out")
-                if len(valid_insight_ids) == 0 and insight_ids_to_verify:
-                    logger.warning(f"QdrantService.vector_search: WARNING - All {len(insight_ids_to_verify)} insights were filtered out during verification!")
-                
-                insight_results_before_filter = len(insight_results)
-                processed_insights = 0
-                skipped_insights = 0
-                
+                # Optimistic Read: Return results directly without validation
+                # Validation will happen when user actually accesses the content
+                # Orphaned insights will be cleaned up by background task
                 for result in insight_results:
-                    insight_id = result.payload.get("insight_id")
-                    if insight_id and insight_id not in valid_insight_ids:
-                        # 已經在驗證階段被刪除或跳過
-                        skipped_insights += 1
-                        continue
-                    
                     try:
-                        # 使用實際的 insight_id 或生成新的 ID
+                        insight_id = result.payload.get("insight_id")
                         result_id = insight_id if insight_id else str(uuid.uuid4())
                         result_dict = {
                             "id": result_id,
                             "title": f"{result.payload.get('insight_type', 'unknown')} - {result.payload.get('source_id', '')}",
-                            "content": result.payload.get("content", ""),
+                            "content": result.payload.get("content", "") if QdrantConfig.store_content_in_payload else "",
                             "parent_id": result.payload.get("source_id", ""),
                             "similarity": result.score,
                             "type": "source_insight"
                         }
                         all_results.append(result_dict)
-                        processed_insights += 1
                     except Exception as result_error:
                         logger.warning(f"QdrantService.vector_search: Failed to process insight result: {result_error}")
-                        skipped_insights += 1
                 
-                # 關鍵修復：記錄insights處理統計
-                logger.info(f"QdrantService.vector_search: Insight processing - {processed_insights} processed, {skipped_insights} skipped out of {insight_results_before_filter} total")
-                
-                # 記錄insights的相似度範圍
-                if processed_insights > 0:
-                    insight_scores = [r.score for r in insight_results if r.payload.get("insight_id") in valid_insight_ids]
-                    if insight_scores:
-                        logger.info(f"QdrantService.vector_search: Insight similarity scores - min={min(insight_scores):.4f}, max={max(insight_scores):.4f}, avg={sum(insight_scores)/len(insight_scores):.4f}")
+                # Log similarity scores
+                if insight_results:
+                    scores = [r.score for r in insight_results]
+                    logger.info(
+                        f"QdrantService.vector_search: Insight similarity scores - "
+                        f"min={min(scores):.4f}, max={max(scores):.4f}, avg={sum(scores)/len(scores):.4f}"
+                    )
             except Exception as e:
                 logger.error(f"QdrantService.vector_search: Error searching source insights: {type(e).__name__}: {e}")
                 logger.exception(e)
@@ -769,14 +785,19 @@ class QdrantService:
     async def cleanup_orphaned_insights(
         self,
         batch_size: int = 100,
-        max_cleanup: Optional[int] = None
+        max_cleanup: Optional[int] = None,
+        rate_limit_delay: float = 0.1
     ) -> Dict[str, int]:
         """
-        定期清理任務：清理 Qdrant 中孤立的 insights（在 Qdrant 中但不在 SurrealDB 中）
+        Periodic cleanup task: Remove orphaned insights from Qdrant (exist in Qdrant but not in SurrealDB).
+        
+        This is a background task that should be run infrequently to avoid impacting search performance.
+        Consider using event-driven deletion instead when SurrealDB records are deleted.
         
         Args:
-            batch_size: 每批處理的 insights 數量
-            max_cleanup: 最多清理的數量（None 表示不限制）
+            batch_size: Number of insights to process per batch
+            max_cleanup: Maximum number of insights to check (None = no limit)
+            rate_limit_delay: Delay between batches in seconds (rate limiting)
             
         Returns:
             Dict with cleanup statistics: {"checked": int, "orphaned": int, "cleaned": int, "failed": int}
@@ -796,26 +817,29 @@ class QdrantService:
             await self._ensure_collections()
             client = await self._ensure_client()
             
-            # 獲取所有 Qdrant 中的 insights
+            # Get all insights from Qdrant with rate limiting
             all_insight_ids = []
             offset = None
             
             logger.info("QdrantService.cleanup_orphaned_insights: Scanning Qdrant for insights...")
             while True:
                 try:
-                    scroll_result = client.scroll(
-                        collection_name="source_insights",
-                        limit=batch_size,
-                        offset=offset,
-                        with_payload=True,
-                        with_vectors=False
-                    )
+                    def _scroll_insights():
+                        return client.scroll(
+                            collection_name="source_insights",
+                            limit=batch_size,
+                            offset=offset,
+                            with_payload=True,
+                            with_vectors=False
+                        )
+                    
+                    scroll_result = await asyncio.to_thread(_scroll_insights)
                     
                     points = scroll_result[0] if scroll_result[0] else []
                     if not points:
                         break
                     
-                    # 提取 insight_ids
+                    # Extract insight_ids
                     for point in points:
                         insight_id = point.payload.get("insight_id")
                         if insight_id:
@@ -824,13 +848,18 @@ class QdrantService:
                     stats["checked"] += len(points)
                     logger.info(f"QdrantService.cleanup_orphaned_insights: Scanned {stats['checked']} insights...")
                     
-                    # 更新 offset
+                    # Rate limiting: delay between batches
+                    if rate_limit_delay > 0:
+                        await asyncio.sleep(rate_limit_delay)
+                    
+                    # Update offset
                     if len(points) < batch_size:
                         break
                     offset = scroll_result[1]  # Next offset
                     
-                    # 如果達到最大清理數量，停止掃描
+                    # Stop if max cleanup limit reached
                     if max_cleanup and stats["checked"] >= max_cleanup:
+                        logger.info(f"QdrantService.cleanup_orphaned_insights: Reached max_cleanup limit ({max_cleanup})")
                         break
                         
                 except Exception as scroll_error:
@@ -940,28 +969,32 @@ class QdrantService:
         
         for collection_name in collections:
             try:
-                # Find all points for this item
-                scroll_result = client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key=key_field,
-                                match=MatchValue(value=item_id)
-                            )
-                        ]
-                    ),
-                    limit=1000  # Adjust based on expected size
-                )
-                
-                if scroll_result[0]:  # If points found
-                    point_ids = [point.id for point in scroll_result[0]]
-                    client.set_payload(
+                @qdrant_retry
+                def _update_associations():
+                    # Find all points for this item
+                    scroll_result = client.scroll(
                         collection_name=collection_name,
-                        payload={"notebook_ids": notebook_ids},
-                        points=point_ids
+                        scroll_filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key=key_field,
+                                    match=MatchValue(value=item_id)
+                                )
+                            ]
+                        ),
+                        limit=1000  # Adjust based on expected size
                     )
-                    logger.info(f"Updated notebook associations for {item_type} {item_id} in {collection_name}")
+                    
+                    if scroll_result[0]:  # If points found
+                        point_ids = [point.id for point in scroll_result[0]]
+                        client.set_payload(
+                            collection_name=collection_name,
+                            payload={"notebook_ids": notebook_ids},
+                            points=point_ids
+                        )
+                
+                await asyncio.to_thread(_update_associations)
+                logger.info(f"Updated notebook associations for {item_type} {item_id} in {collection_name}")
                     
             except Exception as e:
                 logger.error(f"Failed to update notebook associations in {collection_name}: {e}")

@@ -42,6 +42,14 @@ DEFINE FIELD apply_default ON TABLE transformation TYPE bool DEFAULT False;
 DEFINE FIELD created ON transformation DEFAULT time::now() VALUE $before OR time::now();
 DEFINE FIELD updated ON transformation DEFAULT time::now() VALUE time::now();
 
+-- Source chunk table (stores chunked content for vector search)
+DEFINE TABLE source_chunk SCHEMAFULL;
+DEFINE FIELD source_id ON TABLE source_chunk TYPE record<source>;
+DEFINE FIELD chunk_index ON TABLE source_chunk TYPE int;
+DEFINE FIELD content ON TABLE source_chunk TYPE string;
+DEFINE FIELD created ON source_chunk DEFAULT time::now() VALUE $before OR time::now();
+DEFINE FIELD updated ON source_chunk DEFAULT time::now() VALUE time::now();
+
 -- Source insight table (SCHEMALESS - no embedding field)
 DEFINE TABLE source_insight SCHEMALESS;
 
@@ -112,6 +120,9 @@ DEFINE INDEX idx_expires_at ON TABLE idempotency_record COLUMNS expires_at;
 -- PageIndex indexes (for querying sources with PageIndex)
 DEFINE INDEX idx_pageindex_built_at ON TABLE source COLUMNS pageindex_built_at;
 
+-- Source chunk indexes (for efficient deletion and querying)
+DEFINE INDEX idx_source_id ON TABLE source_chunk COLUMNS source_id;
+
 -- =============================================================================
 -- EVENTS
 -- =============================================================================
@@ -119,6 +130,7 @@ DEFINE INDEX idx_pageindex_built_at ON TABLE source COLUMNS pageindex_built_at;
 -- Source delete event (cleanup related data)
 DEFINE EVENT source_delete ON TABLE source WHEN ($after == NONE) THEN {
     DELETE source_insight WHERE source == $before.id;
+    DELETE source_chunk WHERE source_id == $before.id;
     -- Note: pageindex_structure is automatically deleted with the source record
     -- Application layer should clear in-memory cache via PageIndexService.clear_cache_for_source()
 };
