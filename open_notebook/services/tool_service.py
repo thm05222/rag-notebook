@@ -6,9 +6,10 @@ Provides unified interface for all tools (vector search, text search, PageIndex,
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 from loguru import logger
+from pydantic import BaseModel, Field, ValidationError
 
 from open_notebook.exceptions import ToolExecutionError, ToolNotFoundError
 
@@ -23,12 +24,15 @@ class BaseTool(ABC):
         timeout: float = 30.0,
         retry_count: int = 2,
         enabled: bool = True,
+        parameter_model: Optional[Type[BaseModel]] = None,
     ):
         self.name = name
         self.description = description
         self.timeout = timeout
         self.retry_count = retry_count
         self.enabled = enabled
+        self.parameter_model = parameter_model
+        # Keep backward compatibility: maintain parameters dict for tools without Pydantic models
         self.parameters: Dict[str, Any] = {}
 
     @abstractmethod
@@ -50,15 +54,80 @@ class BaseTool(ABC):
         raise NotImplementedError
 
     def validate_parameters(self, **kwargs) -> bool:
-        """Validate tool parameters. Override in subclasses if needed."""
-        return True
+        """
+        Validate tool parameters using Pydantic model if available.
+        Falls back to original validation logic for backward compatibility.
+        """
+        if self.parameter_model is None:
+            # Backward compatibility: return True if no model defined
+            return True
+        
+        try:
+            self.parameter_model.model_validate(kwargs)
+            return True
+        except ValidationError as e:
+            # Log validation errors for debugging
+            error_messages = [err["msg"] for err in e.errors()]
+            logger.warning(
+                f"Parameter validation failed for tool {self.name}: {error_messages}"
+            )
+            return False
+    
+    def get_parameters_schema(self) -> Dict[str, Any]:
+        """
+        Get JSON Schema for tool parameters (OpenAI/Anthropic compatible).
+        Returns empty dict if no Pydantic model is defined (backward compatibility).
+        """
+        if self.parameter_model is None:
+            # Backward compatibility: return original parameters dict if no model
+            return self.parameters
+        
+        # Generate JSON Schema from Pydantic model
+        schema = self.parameter_model.model_json_schema()
+        
+        # Convert to OpenAI/Anthropic compatible format
+        # Remove Pydantic-specific fields like $defs, $schema, title, etc.
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        
+        # Clean up properties: remove any Pydantic-specific metadata and handle nested structures
+        def clean_property(value: Any) -> Any:
+            """Recursively clean property values."""
+            if isinstance(value, dict):
+                cleaned = {}
+                for k, v in value.items():
+                    # Skip Pydantic-specific keys
+                    if k in ["title", "$defs", "$schema"]:
+                        continue
+                    # Recursively clean nested objects
+                    cleaned[k] = clean_property(v)
+                return cleaned
+            elif isinstance(value, list):
+                return [clean_property(item) for item in value]
+            else:
+                return value
+        
+        cleaned_properties = {}
+        for key, value in properties.items():
+            cleaned_properties[key] = clean_property(value)
+        
+        result = {
+            "type": "object",
+            "properties": cleaned_properties,
+        }
+        
+        # Only include required if there are required fields
+        if required:
+            result["required"] = required
+        
+        return result
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert tool to dictionary for LangChain tools."""
         return {
             "name": self.name,
             "description": self.description,
-            "parameters": self.parameters,
+            "parameters": self.get_parameters_schema(),
             "timeout": self.timeout,
             "retry_count": self.retry_count,
             "enabled": self.enabled,
@@ -76,12 +145,23 @@ class BaseTool(ABC):
                 "metadata": {},
             }
 
-        if not self.validate_parameters(**kwargs):
+        # Validate parameters and get detailed error message if validation fails
+        validation_result = self.validate_parameters(**kwargs)
+        if not validation_result:
+            # Try to get detailed validation error message
+            error_msg = f"Invalid parameters for tool {self.name}"
+            if self.parameter_model:
+                try:
+                    self.parameter_model.model_validate(kwargs)
+                except ValidationError as e:
+                    error_details = [f"{err['loc']}: {err['msg']}" for err in e.errors()]
+                    error_msg = f"Invalid parameters for tool {self.name}: {', '.join(error_details)}"
+            
             return {
                 "tool_name": self.name,
                 "success": False,
                 "data": None,
-                "error": f"Invalid parameters for tool {self.name}",
+                "error": error_msg,
                 "execution_time": 0.0,
                 "metadata": {},
             }
@@ -185,6 +265,34 @@ class ToolRegistry:
 tool_registry = ToolRegistry()
 
 
+# Pydantic parameter models for built-in tools
+class VectorSearchParameters(BaseModel):
+    """Parameters for vector search tool."""
+    query: str = Field(..., description="Search query")
+    limit: int = Field(default=10, ge=1, description="Maximum number of results")
+    minimum_score: float = Field(default=0.2, ge=0.0, le=1.0, description="Minimum similarity score (0-1)")
+    search_sources: bool = Field(default=True, description="Search in sources")
+    notebook_ids: Optional[List[str]] = Field(default=None, description="Optional list of notebook IDs to filter by")
+
+
+class TextSearchParameters(BaseModel):
+    """Parameters for text search tool."""
+    query: str = Field(..., description="Search query")
+    limit: int = Field(default=10, ge=1, description="Maximum number of results")
+    search_sources: bool = Field(default=True, description="Search in sources")
+
+
+class CalculationParameters(BaseModel):
+    """Parameters for calculation tool."""
+    expression: str = Field(..., description="Mathematical expression to evaluate (e.g., '2+2', '100 * 3.14', 'convert 100 USD to EUR')")
+
+
+class InternetSearchParameters(BaseModel):
+    """Parameters for internet search tool."""
+    query: str = Field(..., description="Search query")
+    limit: int = Field(default=10, ge=1, description="Maximum number of results")
+
+
 # Built-in tools
 class VectorSearchTool(BaseTool):
     """Vector search tool using Qdrant."""
@@ -195,40 +303,8 @@ class VectorSearchTool(BaseTool):
             description="Perform semantic similarity search using vector embeddings. "
             "Best for finding conceptually similar content even when exact keywords don't match.",
             timeout=60.0,
+            parameter_model=VectorSearchParameters,
         )
-        self.parameters = {
-            "query": {"type": "string", "description": "Search query"},
-            "limit": {"type": "integer", "description": "Maximum number of results", "default": 10},
-            "minimum_score": {
-                "type": "number",
-                "description": "Minimum similarity score (0-1)",
-                "default": 0.2,
-            },
-            "search_sources": {
-                "type": "boolean",
-                "description": "Search in sources",
-                "default": True,
-            },
-            "notebook_ids": {
-                "type": "array",
-                "description": "Optional list of notebook IDs to filter by",
-                "items": {"type": "string"},
-            },
-        }
-
-    def validate_parameters(self, **kwargs) -> bool:
-        """Validate vector search parameters."""
-        if "query" not in kwargs or not kwargs["query"]:
-            return False
-        if "limit" in kwargs and (not isinstance(kwargs["limit"], int) or kwargs["limit"] <= 0):
-            return False
-        if "minimum_score" in kwargs and (
-            not isinstance(kwargs["minimum_score"], (int, float))
-            or kwargs["minimum_score"] < 0
-            or kwargs["minimum_score"] > 1
-        ):
-            return False
-        return True
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Execute vector search."""
@@ -292,24 +368,8 @@ class TextSearchTool(BaseTool):
             description="Perform keyword-based full-text search using BM25 ranking. "
             "Best for finding specific keywords, phrases, or exact matches.",
             timeout=30.0,
+            parameter_model=TextSearchParameters,
         )
-        self.parameters = {
-            "query": {"type": "string", "description": "Search query"},
-            "limit": {"type": "integer", "description": "Maximum number of results", "default": 10},
-            "search_sources": {
-                "type": "boolean",
-                "description": "Search in sources",
-                "default": True,
-            },
-        }
-
-    def validate_parameters(self, **kwargs) -> bool:
-        """Validate text search parameters."""
-        if "query" not in kwargs or not kwargs["query"]:
-            return False
-        if "limit" in kwargs and (not isinstance(kwargs["limit"], int) or kwargs["limit"] <= 0):
-            return False
-        return True
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Execute text search."""
@@ -360,66 +420,6 @@ class TextSearchTool(BaseTool):
             }
 
 
-class CalculationTool(BaseTool):
-    """Mathematical calculation and unit conversion tool."""
-
-    def __init__(self):
-        super().__init__(
-            name="calculator",
-            description="Perform mathematical calculations and unit conversions. "
-            "Supports basic arithmetic, unit conversions, and simple formulas.",
-            timeout=5.0,
-        )
-        self.parameters = {
-            "expression": {
-                "type": "string",
-                "description": "Mathematical expression to evaluate (e.g., '2+2', '100 * 3.14', 'convert 100 USD to EUR')",
-            },
-        }
-
-    def validate_parameters(self, **kwargs) -> bool:
-        """Validate calculation parameters."""
-        if "expression" not in kwargs or not kwargs["expression"]:
-            return False
-        return True
-
-    async def execute(self, **kwargs) -> Dict[str, Any]:
-        """Execute calculation."""
-        import math
-        import re
-
-        expression = kwargs.get("expression", "").strip()
-
-        try:
-            # Basic safety check - only allow numbers, operators, and common functions
-            allowed_chars = set("0123456789+-*/()., ")
-            if not all(c in allowed_chars or c.isalpha() for c in expression):
-                raise ValueError("Expression contains invalid characters")
-
-            # Handle unit conversions (basic implementation)
-            if "convert" in expression.lower() or "to" in expression.lower():
-                # Simple unit conversion placeholder
-                # In production, use a proper unit conversion library
-                result = f"Unit conversion requested: {expression}. "
-                result += "Note: Full unit conversion support requires additional library integration."
-            else:
-                # Safe evaluation of mathematical expressions
-                # Remove any function calls for basic safety
-                safe_expr = re.sub(r"[a-zA-Z_]+", "", expression)
-                result = eval(safe_expr, {"__builtins__": {}}, {"math": math})
-
-            return {
-                "tool_name": self.name,
-                "success": True,
-                "data": {"expression": expression, "result": result},
-                "error": None,
-                "execution_time": 0.0,
-                "metadata": {"calculation_type": "arithmetic"},
-            }
-        except Exception as e:
-            raise ToolExecutionError(f"Calculation failed: {str(e)}") from e
-
-
 class InternetSearchTool(BaseTool):
     """Internet search tool using DuckDuckGo."""
 
@@ -429,19 +429,8 @@ class InternetSearchTool(BaseTool):
             description="Search the internet for current information, news, or information not available in the local knowledge base. "
             "Use this when you need up-to-date information, external resources, or information beyond the documents in the workspace.",
             timeout=30.0,
+            parameter_model=InternetSearchParameters,
         )
-        self.parameters = {
-            "query": {"type": "string", "description": "Search query"},
-            "limit": {"type": "integer", "description": "Maximum number of results", "default": 10},
-        }
-
-    def validate_parameters(self, **kwargs) -> bool:
-        """Validate internet search parameters."""
-        if "query" not in kwargs or not kwargs["query"]:
-            return False
-        if "limit" in kwargs and (not isinstance(kwargs["limit"], int) or kwargs["limit"] <= 0):
-            return False
-        return True
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Execute internet search using DuckDuckGo."""
@@ -540,10 +529,15 @@ class MCPToolWrapper(BaseTool):
             name=tool_name,
             description=description or f"MCP tool from server {server_name}",
             timeout=60.0,
+            # MCP tools don't use Pydantic models - they use dynamic schemas from MCP server
         )
         self.server_name = server_name
         self.actual_tool_name = actual_tool_name
         self.input_schema = tool_info.get("inputSchema", {})
+    
+    def get_parameters_schema(self) -> Dict[str, Any]:
+        """Return MCP input schema directly."""
+        return self.input_schema
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Execute MCP tool."""

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from open_notebook.domain.notebook import Notebook, Source
 from open_notebook.exceptions import ToolNotFoundError
@@ -962,6 +963,55 @@ def convert_pageindex_result(pageindex_result: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+class PageIndexSearchParameters(BaseModel):
+    """Parameters for PageIndex search tool."""
+    query: str = Field(..., description="Search query")
+    document_path: Optional[str] = Field(default=None, description="Optional: Path to specific document file (PDF) to search")
+    notebook_id: Optional[str] = Field(default=None, description="Optional: Search all sources in this notebook")
+    source_ids: Optional[List[str]] = Field(default=None, description="Optional: List of specific source IDs to search")
+    limit: int = Field(default=10, ge=1, description="Maximum number of results")
+    
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, v: str) -> str:
+        """Validate query is not empty."""
+        if not v or not v.strip():
+            raise ValueError("Query cannot be empty or contain only whitespace")
+        return v.strip()
+    
+    @field_validator("source_ids")
+    @classmethod
+    def validate_source_ids(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        """Validate source_ids is not empty if provided."""
+        if v is not None and len(v) == 0:
+            raise ValueError("source_ids cannot be an empty list")
+        return v
+    
+    @field_validator("document_path")
+    @classmethod
+    def validate_document_path(cls, v: Optional[str]) -> Optional[str]:
+        """Validate document_path if provided."""
+        if v:
+            if not v.lower().endswith('.pdf'):
+                raise ValueError("Document path must be a PDF file")
+            if not os.path.exists(v):
+                raise ValueError(f"Document file not found: {v}")
+        return v
+    
+    @model_validator(mode="after")
+    def validate_at_least_one_target(self):
+        """Validate that at least one search target is provided."""
+        has_document_path = bool(self.document_path)
+        has_notebook_id = bool(self.notebook_id)
+        has_source_ids = bool(self.source_ids and len(self.source_ids) > 0)
+        
+        if not (has_document_path or has_notebook_id or has_source_ids):
+            raise ValueError(
+                "Must provide at least one of: document_path, notebook_id, or source_ids"
+            )
+        return self
+
+
 class PageIndexSearchTool(BaseTool):
     """PageIndex search tool wrapper."""
 
@@ -973,128 +1023,9 @@ class PageIndexSearchTool(BaseTool):
             "Uses document structure and LLM reasoning for precise retrieval. "
             "Supports searching in specific documents or all sources in a notebook.",
             timeout=300.0,  # 增加 timeout，因為建立索引可能需要時間
+            parameter_model=PageIndexSearchParameters,
         )
-        self.parameters = {
-            "query": {"type": "string", "description": "Search query"},
-            "document_path": {
-                "type": "string",
-                "description": "Optional: Path to specific document file (PDF) to search",
-                "optional": True
-            },
-            "notebook_id": {
-                "type": "string",
-                "description": "Optional: Search all sources in this notebook",
-                "optional": True
-            },
-            "source_ids": {
-                "type": "array",
-                "description": "Optional: List of specific source IDs to search",
-                "items": {"type": "string"},
-                "optional": True
-            },
-            "limit": {"type": "integer", "description": "Maximum number of results", "default": 10},
-        }
         self.service = PageIndexService()
-        self._last_validation_error: Optional[str] = None
-
-    def validate_parameters(self, **kwargs) -> bool:
-        """Validate PageIndex search parameters."""
-        self._last_validation_error = None
-        
-        # 驗證 query 參數
-        if "query" not in kwargs or not kwargs["query"]:
-            error_msg = "Missing or empty 'query' parameter"
-            logger.warning(f"{self.name}: {error_msg}")
-            self._last_validation_error = error_msg
-            return False
-        
-        if not isinstance(kwargs["query"], str):
-            error_msg = f"'query' must be a string, got {type(kwargs['query']).__name__}"
-            logger.warning(f"{self.name}: {error_msg}")
-            self._last_validation_error = error_msg
-            return False
-        
-        # 檢查是否為空字符串或僅包含空白字符
-        if not kwargs["query"].strip():
-            error_msg = "'query' cannot be empty or contain only whitespace"
-            logger.warning(f"{self.name}: {error_msg}")
-            self._last_validation_error = error_msg
-            return False
-        
-        # 驗證 limit 參數（如果提供）
-        if "limit" in kwargs:
-            limit = kwargs["limit"]
-            if not isinstance(limit, int):
-                error_msg = f"'limit' must be an integer, got {type(limit).__name__}"
-                logger.warning(f"{self.name}: {error_msg}")
-                self._last_validation_error = error_msg
-                return False
-            if limit <= 0:
-                error_msg = f"'limit' must be greater than 0, got {limit}"
-                logger.warning(f"{self.name}: {error_msg}")
-                self._last_validation_error = error_msg
-                return False
-        
-        # 驗證 source_ids 參數（如果提供）
-        if "source_ids" in kwargs:
-            source_ids = kwargs["source_ids"]
-            if source_ids is not None:
-                if not isinstance(source_ids, list):
-                    error_msg = f"'source_ids' must be a list, got {type(source_ids).__name__}"
-                    logger.warning(f"{self.name}: {error_msg}")
-                    self._last_validation_error = error_msg
-                    return False
-                if len(source_ids) == 0:
-                    error_msg = "'source_ids' cannot be an empty list"
-                    logger.warning(f"{self.name}: {error_msg}")
-                    self._last_validation_error = error_msg
-                    return False
-                # 驗證列表中的每個元素都是字符串
-                if not all(isinstance(sid, str) for sid in source_ids):
-                    error_msg = "All elements in 'source_ids' must be strings"
-                    logger.warning(f"{self.name}: {error_msg}")
-                    self._last_validation_error = error_msg
-                    return False
-        
-        # 驗證 document_path 參數（如果提供）
-        if "document_path" in kwargs and kwargs.get("document_path"):
-            doc_path = kwargs["document_path"]
-            if not isinstance(doc_path, str):
-                error_msg = f"'document_path' must be a string, got {type(doc_path).__name__}"
-                logger.warning(f"{self.name}: {error_msg}")
-                self._last_validation_error = error_msg
-                return False
-            
-            # 驗證文件是否存在（同步檢查，因為這是驗證階段）
-            if not os.path.exists(doc_path):
-                error_msg = f"Document file not found: {doc_path}"
-                logger.warning(f"{self.name}: {error_msg}")
-                self._last_validation_error = error_msg
-                return False
-            
-            # 驗證文件擴展名（僅支持 PDF）
-            if not doc_path.lower().endswith('.pdf'):
-                error_msg = f"Document path must be a PDF file, got: {doc_path}"
-                logger.warning(f"{self.name}: {error_msg}")
-                self._last_validation_error = error_msg
-                return False
-        
-        # 至少需要提供一個搜索目標
-        has_document_path = bool(kwargs.get("document_path"))
-        has_notebook_id = bool(kwargs.get("notebook_id"))
-        source_ids = kwargs.get("source_ids")
-        has_source_ids = bool(source_ids and isinstance(source_ids, list) and len(source_ids) > 0)
-        
-        if not (has_document_path or has_notebook_id or has_source_ids):
-            error_msg = (
-                f"Must provide at least one of: document_path, notebook_id, or source_ids. "
-                f"Got document_path={has_document_path}, notebook_id={has_notebook_id}, source_ids={has_source_ids}"
-            )
-            logger.warning(f"{self.name}: {error_msg}")
-            self._last_validation_error = error_msg
-            return False
-        
-        return True
     
     async def execute_with_retry(self, **kwargs) -> Dict[str, Any]:
         """Execute tool with retry logic and detailed error messages."""
@@ -1108,8 +1039,20 @@ class PageIndexSearchTool(BaseTool):
                 "metadata": {},
             }
 
+        # Validate parameters using Pydantic model
         if not self.validate_parameters(**kwargs):
-            error_msg = self._last_validation_error or f"Invalid parameters for tool {self.name}"
+            # Get detailed validation error from Pydantic
+            error_msg = f"Invalid parameters for tool {self.name}"
+            if self.parameter_model:
+                try:
+                    self.parameter_model.model_validate(kwargs)
+                except Exception as e:
+                    if hasattr(e, "errors"):
+                        error_details = [f"{err['loc']}: {err['msg']}" for err in e.errors()]
+                        error_msg = f"Invalid parameters for tool {self.name}: {', '.join(error_details)}"
+                    else:
+                        error_msg = f"Invalid parameters for tool {self.name}: {str(e)}"
+            
             # 詳細記錄參數驗證失敗的信息
             logger.error(
                 f"{self.name}: Parameter validation failed. "
@@ -1121,7 +1064,7 @@ class PageIndexSearchTool(BaseTool):
                 "tool_name": self.name,
                 "success": False,
                 "data": None,
-                "error": f"Invalid parameters for tool {self.name}: {error_msg}",
+                "error": error_msg,
                 "execution_time": 0.0,
                 "metadata": {
                     "validation_error": error_msg,

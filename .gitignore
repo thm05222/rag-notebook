@@ -15,6 +15,7 @@ __pycache__/
 *.py[cod]
 venv/
 .env
+*.env
 .DS_Store
 
 # 忽略前端依賴
@@ -33,3 +34,5 @@ build/
 *.rar
 docker.env
 test_pageindex/
+test_pageindex/pageindex/
+logs/
