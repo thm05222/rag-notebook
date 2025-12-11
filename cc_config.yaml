@@ -1,0 +1,20 @@
+extraction:
+  pymupdf:
+    # 啟用 OCR 功能（處理掃描的 PDF 和圖片中的文字）
+    ocr_enabled: true
+    
+    # 啟用公式密集頁面的 OCR
+    enable_formula_ocr: true
+    
+    # 觸發 OCR 的每頁最小公式數量
+    formula_threshold: 3
+    
+    # 如果 OCR 失敗，則進行優雅的回退
+    ocr_fallback: true
+    
+    # OCR 語言設定（支援多語言）
+    ocr_languages: ["eng", "chi_sim", "chi_tra"]
+    
+    # 當檢測到圖片頁面時自動使用 OCR
+    auto_ocr_on_image_pages: true
+

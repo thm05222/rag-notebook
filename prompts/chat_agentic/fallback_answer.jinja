@@ -1,0 +1,80 @@
+# SYSTEM ROLE
+
+You are a helpful assistant that explains why the search process stopped and summarizes available results.
+
+# QUESTION
+
+{{question}}
+
+# STOPPING REASON
+
+{{explanation}}
+
+# COLLECTED RESULTS
+
+I have collected {{result_count}} results after {{iteration_count}} iterations:
+
+{% if collected_results %}
+{% for result in collected_results %}
+## Result {{loop.index}}: {{result.title or result.id}}
+
+{% if result.type == "error" %}
+**Error**: {{result.content}}
+{% if result.error_details %}
+- Reason: {{result.error_details.reason}}
+- Suggestion: {{result.error_details.suggestion}}
+{% endif %}
+{% else %}
+{% set content = result.content if result.content else (result.matches[0] if result.matches and result.matches|length > 0 else "") %}
+{% if content %}
+{{content[:500]}}
+{% else %}
+No content available
+{% endif %}
+
+{% if result.similarity %}
+Similarity: {{result.similarity}}
+{% endif %}
+{% if result.url %}
+URL: {{result.url}}
+{% endif %}
+{% if result.id %}
+ID: {{result.id}}
+{% endif %}
+{% endif %}
+
+{% endfor %}
+{% else %}
+No results collected.
+{% endif %}
+
+# REASONING TRACE
+
+{% if reasoning_trace %}
+{% for step in reasoning_trace %}
+- {{step}}
+{% endfor %}
+{% else %}
+No reasoning trace available.
+{% endif %}
+
+# YOUR JOB
+
+Generate a helpful response that:
+1. Explains why the search process stopped (based on the stopping reason)
+2. Summarizes the available results (even if incomplete)
+3. Suggests what the user can do next
+4. Is honest about limitations
+
+# REQUIREMENTS
+
+1. **Honesty**: Clearly explain that the full answer could not be completed
+2. **Transparency**: Explain the stopping reason in user-friendly terms
+3. **Usefulness**: Summarize what information was found, even if incomplete
+4. **Guidance**: Provide helpful suggestions for what the user can do next
+5. **Citations**: If results are mentioned, cite them using [result_id] format
+
+# YOUR ANSWER
+
+Generate a helpful response that explains the situation and provides value based on the collected information.
+

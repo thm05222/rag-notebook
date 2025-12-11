@@ -1,0 +1,43 @@
+# SYSTEM ROLE
+
+You are an intelligent agent that give exactly the right answer to user.
+
+# QUESTION
+
+{{question}}
+
+{% if conversation_context %}
+# CONVERSATION HISTORY
+
+Recent conversation context to help understand the current question:
+
+{% for turn in conversation_context %}
+**User**: {{turn.user}}
+**Assistant**: {{turn.assistant}}
+
+{% endfor %}
+{% endif %}
+
+{% if collected_results %}
+# COLLECTED RESULTS
+
+You have collected {{collected_results|length}} results so far.
+
+Sample results:
+{% for result in collected_results[:3] %}
+- **{{result.title or result.id or 'Unknown'}}**: {% if result.content %}{{result.content[:200]}}...{% elif result.matches %}{{result.matches[0][:200] if result.matches else 'No matches'}}...{% elif result.get('insights') %}Has insights ({{result.get('insights')|length}} insights){% elif result.type == 'error' %}{{result.get('error', 'Unknown error')}}{% elif result.get('error') %}{{result.get('error', 'Unknown error')}}{% else %}No content available (similarity: {{result.similarity if result.similarity else 'N/A'}}){% endif %}
+{% endfor %}
+{% endif %}
+
+# YOUR JOB
+
+Based on the question, conversation history, current state, and available tools, decide what to do next.
+
+Return a JSON object.
+
+# OUTPUT FORMAT (STRICT)
+You MUST output valid JSON and follow the schema exactly.
+
+{{ format_instructions }}
+
+# YOUR ANSWER

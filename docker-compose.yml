@@ -1,0 +1,80 @@
+services:
+    surrealdb:
+        image: surrealdb/surrealdb:v2
+        volumes:
+            - ./surreal_data:/mydata
+        environment:
+            - SURREAL_EXPERIMENTAL_GRAPHQL=true
+        command: start --log info --user root --pass root rocksdb:/mydata/mydatabase.db
+        pull_policy: never
+        user: root
+        restart: always
+    qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+            - "6333:6333" # REST API
+            - "6334:6334" # gRPC
+        volumes:
+            - ./qdrant_data:/qdrant/storage
+        environment:
+            - QDRANT__SERVICE__HTTP_PORT=6333
+            - QDRANT__SERVICE__GRPC_PORT=6334
+        pull_policy: never
+        restart: always
+        healthcheck:
+            # Check if port 6333 is listening using /proc/net/tcp
+            # Port 6333 in hex (big-endian) is 18BD, and 0A means LISTEN state
+            # curl/wget are not available in qdrant image
+            test:
+                [
+                    "CMD-SHELL",
+                    "grep -q ':18BD.*:0000 0A' /proc/net/tcp || exit 1",
+                ]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 40s
+    open_notebook:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        ports:
+            - "0.0.0.0:8188:8188" # 绑定所有接口，实际会监听在 192.168.0.188（如果已配置）
+            - "0.0.0.0:5055:5055"
+        # 如果需要仅绑定特定 IP，取消注释下面两行并注释上面两行：
+        # - "192.168.0.188:8188:8188"
+        # - "192.168.0.188:5055:5055"
+        env_file:
+            - ./docker.env
+        depends_on:
+            - surrealdb
+            - qdrant
+        volumes:
+            - ./notebook_data:/app/data
+            - ./open_notebook:/app/open_notebook
+            - ./prompts:/app/prompts
+            - ./api:/app/api
+            - ./commands:/app/commands
+            - ./cc_config.yaml:/app/cc_config.yaml
+        restart: always
+        # Docker logging driver for log rotation (since stdout/stderr cannot be rotated by supervisord)
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "50m"
+                max-file: "5"
+        healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:5055/health"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 40s
+        # Resource limits (for standalone docker-compose)
+        # Note: 'deploy' section only works in Docker Swarm mode
+        mem_limit: 4g
+        mem_reservation: 512m
+        cpus: "2.0"
+        ulimits:
+            nofile:
+                soft: 65536
+                hard: 65536

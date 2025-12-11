@@ -1,0 +1,13 @@
+services:
+  rag_notebook:
+    image: rag-notebook:v1-latest-single
+    ports:
+      - "8188:8188"
+      - "5055:5055"
+    env_file:
+      - ./docker.env
+    pull_policy: always
+    volumes:
+      - ./notebook_data:/app/data
+      - ./surreal_single_data:/mydata
+    restart: always
