@@ -1,4 +1,3 @@
-import asyncio
 import sqlite3
 from typing import Annotated, Dict, List, Optional
 
@@ -27,7 +26,7 @@ class SourceChatState(TypedDict):
     context_indicators: Optional[Dict[str, List[str]]]
 
 
-def call_model_with_source_context(
+async def call_model_with_source_context(
     state: SourceChatState, config: RunnableConfig
 ) -> dict:
     """
@@ -43,35 +42,13 @@ def call_model_with_source_context(
     if not source_id:
         raise ValueError("source_id is required in state")
 
-    # Build source context using ContextBuilder (run async code in new loop)
-    def build_context():
-        """Build context in a new event loop"""
-        new_loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(new_loop)
-            context_builder = ContextBuilder(
-                source_id=source_id,
-                include_insights=True,
-                max_tokens=50000,  # Reasonable limit for source context
-            )
-            return new_loop.run_until_complete(context_builder.build())
-        finally:
-            new_loop.close()
-            asyncio.set_event_loop(None)
-
-    # Get the built context
-    try:
-        # Try to get the current event loop
-        asyncio.get_running_loop()
-        # If we're in an event loop, run in a thread with a new loop
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(build_context)
-            context_data = future.result()
-    except RuntimeError:
-        # No event loop running, safe to create a new one
-        context_data = build_context()
+    # Build source context using ContextBuilder
+    context_builder = ContextBuilder(
+        source_id=source_id,
+        include_insights=True,
+        max_tokens=50000,  # Reasonable limit for source context
+    )
+    context_data = await context_builder.build()
 
     # Extract source and insights from context
     source = None
@@ -115,47 +92,17 @@ def call_model_with_source_context(
     # Truncate messages to prevent exceeding token limits
     payload = truncate_payload_with_system_message(system_msg, messages)
 
-    # Handle async model provisioning from sync context
-    def run_in_new_loop():
-        """Run the async function in a new event loop"""
-        new_loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(new_loop)
-            return new_loop.run_until_complete(
-                provision_langchain_model(
-                    str(payload),
-                    config.get("configurable", {}).get("model_id")
-                    or state.get("model_override"),
-                    "chat",
-                    max_tokens=8192,
-                )
-            )
-        finally:
-            new_loop.close()
-            asyncio.set_event_loop(None)
+    # Provision model asynchronously
+    model = await provision_langchain_model(
+        str(payload),
+        config.get("configurable", {}).get("model_id")
+        or state.get("model_override"),
+        "chat",
+        max_tokens=8192,
+    )
 
-    try:
-        # Try to get the current event loop
-        asyncio.get_running_loop()
-        # If we're in an event loop, run in a thread with a new loop
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(run_in_new_loop)
-            model = future.result()
-    except RuntimeError:
-        # No event loop running, safe to use asyncio.run()
-        model = asyncio.run(
-            provision_langchain_model(
-                str(payload),
-                config.get("configurable", {}).get("model_id")
-                or state.get("model_override"),
-                "chat",
-                max_tokens=8192,
-            )
-        )
-
-    ai_message = model.invoke(payload)
+    # Invoke model asynchronously
+    ai_message = await model.ainvoke(payload)
 
     # Update state with context information
     return {
@@ -208,12 +155,40 @@ def _format_source_context(context_data: Dict) -> str:
                 )
                 context_parts.append("")  # Empty line for separation
 
+    # Add search results (from tools like VectorSearch or PageIndex)
+    if context_data.get("search_results"):
+        context_parts.append("## SEARCH RESULTS")
+        for result in context_data["search_results"]:
+            if isinstance(result, dict):
+                # Handle different result formats
+                if result.get("title"):
+                    context_parts.append(f"**Title:** {result.get('title')}")
+                if result.get("summary"):
+                    context_parts.append(f"**Summary:** {result.get('summary')}")
+                if result.get("content"):
+                    content = result.get("content", "")
+                    if len(content) > 2000:
+                        content = content[:2000] + "...\n[Content truncated]"
+                    context_parts.append(f"**Content:**\n{content}")
+                elif result.get("text"):
+                    text = result.get("text", "")
+                    if len(text) > 2000:
+                        text = text[:2000] + "...\n[Content truncated]"
+                    context_parts.append(f"**Text:**\n{text}")
+                if result.get("metadata"):
+                    context_parts.append(f"**Metadata:** {result.get('metadata')}")
+                if result.get("similarity"):
+                    context_parts.append(f"**Similarity:** {result.get('similarity'):.3f}")
+                context_parts.append("")  # Empty line for separation
+
     # Add metadata
     if context_data.get("metadata"):
         metadata = context_data["metadata"]
         context_parts.append("## CONTEXT METADATA")
         context_parts.append(f"- Source count: {metadata.get('source_count', 0)}")
         context_parts.append(f"- Insight count: {metadata.get('insight_count', 0)}")
+        if metadata.get("search_result_count", 0) > 0:
+            context_parts.append(f"- Search result count: {metadata.get('search_result_count', 0)}")
         context_parts.append(f"- Total tokens: {context_data.get('total_tokens', 0)}")
         context_parts.append("")
 

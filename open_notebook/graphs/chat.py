@@ -70,6 +70,7 @@ class ChatAgenticState(TypedDict):
     error_history: Annotated[List[Dict[str, Any]], operator.add]  # Error history
     model_override: Optional[str]  # Model override for this session
     current_decision: Optional[Dict[str, Any]]  # 當前決策（關鍵修復：添加缺失的字段）
+    refinement_feedback: Optional[Dict[str, Any]]  # Feedback from Refiner when rejecting answer
 
 
 class Decision(BaseModel):
@@ -270,6 +271,7 @@ async def initialize_chat_state(
         "error_history": [],  # 強制重置
         "model_override": state.get("model_override"),
         "current_decision": None,  # 關鍵修復：強制重置當前決策為 None
+        "refinement_feedback": None,  # 強制重置 feedback
     }
 
     logger.info(
@@ -397,10 +399,62 @@ async def agent_decision(
             "final_answer": final_answer,
         }
 
+    # 新增：檢查 collected_results 的長度和 token 數量，防止無限累積
+    collected_results = state.get("collected_results", [])
+    collected_results_count = len(collected_results)
+    
+    # 估算 collected_results 的 token 數量
+    collected_results_tokens = 0
+    MAX_COLLECTED_RESULTS = 50  # 最大結果數量
+    MAX_COLLECTED_TOKENS = 100000  # 最大 token 數量（100k）
+    
+    if collected_results:
+        # 估算每個結果的平均 token 數（基於 content 長度）
+        for result in collected_results:
+            content = result.get("content", "") or result.get("text", "") or result.get("summary", "")
+            if isinstance(content, str):
+                collected_results_tokens += token_count(content)
+            elif isinstance(content, list):
+                # 如果是列表（如 matches），計算所有元素的 token
+                for item in content:
+                    if isinstance(item, str):
+                        collected_results_tokens += token_count(item)
+    
+    # 如果超過限制，強制選擇 synthesize 或 summarize
+    if collected_results_count > MAX_COLLECTED_RESULTS:
+        logger.warning(
+            f"[Iteration {iteration}] Collected results count ({collected_results_count}) exceeds limit ({MAX_COLLECTED_RESULTS}), forcing synthesize"
+        )
+        return {
+            "current_decision": {"action": "synthesize"},
+            "reasoning_trace": [
+                f"Collected results count ({collected_results_count}) exceeds limit ({MAX_COLLECTED_RESULTS}), forcing synthesis"
+            ],
+            "iteration_count": state["iteration_count"] + 1,
+        }
+    
+    if collected_results_tokens > MAX_COLLECTED_TOKENS:
+        logger.warning(
+            f"[Iteration {iteration}] Collected results tokens ({collected_results_tokens}) exceeds limit ({MAX_COLLECTED_TOKENS}), forcing synthesize"
+        )
+        return {
+            "current_decision": {"action": "synthesize"},
+            "reasoning_trace": [
+                f"Collected results tokens ({collected_results_tokens}) exceeds limit ({MAX_COLLECTED_TOKENS}), forcing synthesis"
+            ],
+            "iteration_count": state["iteration_count"] + 1,
+        }
+    
+    # 記錄當前狀態
+    if collected_results_count > 0:
+        logger.info(
+            f"[Iteration {iteration}] Collected results: {collected_results_count} items, ~{collected_results_tokens} tokens"
+        )
+
     # Get available tools
     available_tools = await tool_registry.list_tools()
 
-    # 關鍵修復：記錄所有可用工具，特別標記 MCP 工具
+    # 關鍵修復：記錄所有可用工具，特別標記 MCP 工具和 PageIndex
     tool_names = [tool.get("name", "unknown") for tool in available_tools]
     mcp_tools = [
         name
@@ -410,6 +464,12 @@ async def agent_decision(
         or "yahoo" in name.lower()
         or "finance" in name.lower()
     ]
+    pageindex_tools = [
+        name
+        for name in tool_names
+        if "pageindex" in name.lower() or "page_index" in name.lower()
+    ]
+    
     logger.info(
         f"[Iteration {iteration}] Available tools ({len(available_tools)} total): {', '.join(tool_names)}"
     )
@@ -421,12 +481,53 @@ async def agent_decision(
         logger.warning(
             f"[Iteration {iteration}] No MCP tools detected in available tools list"
         )
+    
+    if pageindex_tools:
+        logger.info(
+            f"[Iteration {iteration}] PageIndex tools detected: {', '.join(pageindex_tools)}"
+        )
+    
+    # 增強工具信息：確保每個工具都包含完整的描述和參數 schema
+    enhanced_tools = []
+    for tool in available_tools:
+        enhanced_tool = {
+            "name": tool.get("name", "unknown"),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("parameters", {}),
+            "category": _categorize_tool(tool.get("name", "")),
+        }
+        # 特別標記 PageIndex 工具
+        if "pageindex" in tool.get("name", "").lower():
+            enhanced_tool["special_note"] = "PageIndex tool: Use for structured document search and hierarchical content retrieval"
+        enhanced_tools.append(enhanced_tool)
+    
+    available_tools = enhanced_tools
+
+
+def _categorize_tool(tool_name: str) -> str:
+    """將工具分類為：local_search, external_api, pageindex, calculation, etc."""
+    tool_name_lower = tool_name.lower()
+    if "pageindex" in tool_name_lower or "page_index" in tool_name_lower:
+        return "pageindex"
+    elif "vector" in tool_name_lower or "text" in tool_name_lower:
+        return "local_search"
+    elif "::" in tool_name or "mcp" in tool_name_lower:
+        return "external_api"
+    elif "calculation" in tool_name_lower or "calc" in tool_name_lower:
+        return "calculation"
+    elif "internet" in tool_name_lower or "search" in tool_name_lower:
+        return "internet_search"
+    else:
+        return "other"
 
     # Prepare decision prompt data
     # 包含錯誤歷史，讓 Agent 知道哪些工具失敗了（關鍵修復）
     error_history = state.get("error_history", [])
     recent_errors = error_history[-5:] if error_history else []  # 最近 5 個錯誤
 
+    # 獲取 refinement_feedback（如果存在）
+    refinement_feedback = state.get("refinement_feedback")
+    
     prompt_data = {
         "question": state["question"],
         "iteration_count": state["iteration_count"],
@@ -434,7 +535,9 @@ async def agent_decision(
         "token_count": state["token_count"],
         "max_tokens": state["max_tokens"],
         "search_history": state["search_history"][-3:],
-        "collected_results": state["collected_results"],
+        "collected_results": collected_results,  # 使用檢查過的 collected_results
+        "collected_results_count": collected_results_count,  # 添加計數信息
+        "collected_results_tokens": collected_results_tokens,  # 添加 token 信息
         "partial_answer": state.get("partial_answer", ""),
         "reasoning_trace": state["reasoning_trace"][-3:],
         "available_tools": available_tools,
@@ -443,6 +546,7 @@ async def agent_decision(
         "decision_history": state.get("decision_history", [])[
             -5:
         ],  # 最近 5 個決策，幫助避免循環
+        "refinement_feedback": refinement_feedback,  # 添加 Refiner 的 feedback
     }
 
     parser = PydanticOutputParser(pydantic_object=Decision)
@@ -475,8 +579,64 @@ async def agent_decision(
         )
         cleaned_content = clean_thinking_content(content)
 
-        # Parse decision
-        decision = parser.parse(cleaned_content)
+        # Parse decision with retry logic
+        max_retries = 3
+        decision = None
+        parse_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                decision = parser.parse(cleaned_content)
+                break
+            except Exception as e:
+                parse_error = e
+                logger.warning(
+                    f"[Iteration {iteration}] Parser failed (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                
+                if attempt < max_retries - 1:
+                    # 將錯誤訊息加入 prompt，讓 LLM 修正
+                    prompt_data["parse_error"] = str(e)
+                    prompt_data["previous_attempt"] = cleaned_content[:500]  # 保留前500字符作為參考
+                    system_prompt = Prompter(
+                        prompt_template="chat_agentic/decision", parser=parser
+                    ).render(data=prompt_data)
+                    
+                    # 重新生成
+                    logger.info(
+                        f"[Iteration {iteration}] Retrying decision generation with parse error feedback..."
+                    )
+                    response = await model.ainvoke(system_prompt)
+                    content = (
+                        response.content
+                        if isinstance(response.content, str)
+                        else str(response.content)
+                    )
+                    cleaned_content = clean_thinking_content(content)
+                else:
+                    # 最後一次嘗試失敗，使用 fallback
+                    logger.error(
+                        f"[Iteration {iteration}] Parser failed after {max_retries} attempts, using fallback decision"
+                    )
+                    # 使用 fallback 決策（默認使用 vector_search）
+                    decision = Decision(
+                        action="use_tool",
+                        tool_name="vector_search",
+                        parameters={"query": state["question"], "limit": 10},
+                        reasoning=f"Parser failed after {max_retries} attempts: {str(parse_error)}. Using fallback decision."
+                    )
+        
+        if decision is None:
+            # 如果所有嘗試都失敗且沒有 fallback，使用默認決策
+            logger.error(
+                f"[Iteration {iteration}] All parsing attempts failed, using default decision"
+            )
+            decision = Decision(
+                action="use_tool",
+                tool_name="vector_search",
+                parameters={"query": state["question"], "limit": 10},
+                reasoning="Parser failed, using default decision."
+            )
 
         logger.info(
             f"[Iteration {iteration}] Decision: action={decision.action}, tool={decision.tool_name}, reasoning={decision.reasoning[:100] if decision.reasoning else 'None'}..."
@@ -572,6 +732,62 @@ def route_decision(state: ChatAgenticState) -> str:
     tool_name = current_decision.get("tool_name", "no tool")
     logger.info(f"[Iteration {iteration}] Routing to: {action} (tool: {tool_name})")
     return action
+
+
+def _flatten_pageindex_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    將 PageIndex 的樹狀 JSON 結構扁平化為 Markdown 格式。
+    
+    Args:
+        result: PageIndex 返回的結果字典
+        
+    Returns:
+        扁平化後的結果字典，包含格式化的 content 欄位
+    """
+    title = result.get("title", "")
+    summary = result.get("summary", "")
+    text = result.get("text", "")
+    metadata = result.get("metadata", {})
+    
+    # 構建 Markdown 格式的內容
+    markdown_parts = []
+    
+    if title:
+        markdown_parts.append(f"## {title}")
+    
+    if summary:
+        markdown_parts.append(f"\n{summary}")
+    
+    if text:
+        markdown_parts.append(f"\n{text}")
+    
+    if metadata:
+        # 格式化 metadata（例如頁碼、章節等）
+        metadata_str = ", ".join([f"{k}: {v}" for k, v in metadata.items() if v])
+        if metadata_str:
+            markdown_parts.append(f"\n\n**Metadata:** {metadata_str}")
+    
+    # 合併所有部分
+    formatted_content = "\n".join(markdown_parts)
+    
+    # 返回標準化的結果格式
+    flattened = {
+        "id": result.get("id", result.get("node_id", "")),
+        "title": title,
+        "content": formatted_content,
+        "summary": summary,
+        "text": text,
+        "metadata": metadata,
+        "type": "pageindex",
+        "similarity": result.get("similarity", 0.0),
+    }
+    
+    # 保留原始結果中的其他欄位
+    for key, value in result.items():
+        if key not in flattened:
+            flattened[key] = value
+    
+    return flattened
 
 
 async def execute_tool(
@@ -825,6 +1041,9 @@ async def execute_tool(
             valid_results = []
             invalid_results = []
             missing_fields_count = {"id": 0, "content": 0, "matches": 0}
+            
+            # 檢查是否是 PageIndex 工具
+            is_pageindex = "pageindex" in tool_name.lower() or "page_index" in tool_name.lower()
 
             for idx, item in enumerate(tool_data):
                 if not isinstance(item, dict):
@@ -833,6 +1052,19 @@ async def execute_tool(
                     )
                     invalid_results.append(idx)
                     continue
+
+                # 如果是 PageIndex 結果，使用適配器扁平化
+                if is_pageindex:
+                    try:
+                        item = _flatten_pageindex_result(item)
+                        logger.debug(
+                            f"[Iteration {iteration}] Tool {tool_name} result {idx} flattened from PageIndex format"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[Iteration {iteration}] Failed to flatten PageIndex result {idx}: {e}"
+                        )
+                        # 繼續處理，不中斷
 
                 # 檢查必要字段
                 has_id = bool(item.get("id"))
@@ -864,17 +1096,36 @@ async def execute_tool(
                     f"[Iteration {iteration}] Tool {tool_name}: {len(invalid_results)} invalid results (not dict)"
                 )
 
-            # 過濾重複結果
+            # 過濾重複結果（基於 result.id）
             new_results = []
-            existing_ids = [
-                r.get("id") for r in state["collected_results"] if r.get("id")
-            ]
+            # 使用 set 提高查找效率
+            existing_ids = {
+                r.get("id")
+                for r in state["collected_results"]
+                if r.get("id")
+            }
+            seen_ids_in_batch = set()  # 用於檢測同一批次內的重複
+            
             for item in valid_results:
                 item_id = item.get("id")
-                if item_id and item_id not in existing_ids:
-                    new_results.append(item)
-                elif not item_id:
+                if item_id:
+                    # 檢查是否在已收集的結果中
+                    if item_id not in existing_ids:
+                        # 檢查是否在同一批次中重複
+                        if item_id not in seen_ids_in_batch:
+                            new_results.append(item)
+                            seen_ids_in_batch.add(item_id)
+                        else:
+                            logger.debug(
+                                f"[Iteration {iteration}] Tool {tool_name}: Skipping duplicate result in batch: {item_id[:50]}"
+                            )
+                    else:
+                        logger.debug(
+                            f"[Iteration {iteration}] Tool {tool_name}: Skipping duplicate result (already in collected_results): {item_id[:50]}"
+                        )
+                else:
                     # 如果沒有ID，直接添加（避免重複檢查）
+                    # 但可以基於內容的 hash 進行去重（可選）
                     new_results.append(item)
 
             logger.info(
@@ -1470,6 +1721,42 @@ async def synthesize_answer(
                     f"Quality score: {combined_score:.2f}, hallucination risk: {risk_score:.2f}",
                 ],
             }
+        
+        # 如果評估結果為 reject，生成 feedback 供 Orchestrator 使用
+        if decision == "reject":
+            # 生成 feedback
+            refinement_feedback = {
+                "reason": eval_result.get("reasoning", "Answer quality below threshold"),
+                "suggested_actions": [
+                    "Search for more specific information",
+                    "Refine search query based on missing information",
+                    "Try different search tools (e.g., PageIndex if available)",
+                ],
+                "missing_info": [
+                    "More detailed information needed",
+                    "Higher quality sources required",
+                ],
+                "quality_score": combined_score,
+                "hallucination_risk": risk_score,
+                "evaluation_details": eval_result,
+            }
+            
+            logger.info(
+                f"[Iteration {iteration}] synthesize_answer: Answer rejected, generating feedback for Orchestrator"
+            )
+            
+            return {
+                "partial_answer": answer,
+                "final_answer": None,  # 不設為最終答案
+                "hallucination_check": hallucination_check,
+                "evaluation_result": eval_result,
+                "refinement_feedback": refinement_feedback,  # 添加 feedback
+                "iteration_count": state["iteration_count"] + 1,
+                "reasoning_trace": [
+                    f"Generated answer rejected: quality score {combined_score:.2f}, hallucination risk {risk_score:.2f}",
+                    f"Feedback generated for Orchestrator: {refinement_feedback['reason']}",
+                ],
+            }
 
         logger.info(
             f"[Iteration {iteration}] synthesize_answer: Setting final_answer (length: {len(answer)} chars)"
@@ -1980,24 +2267,41 @@ agent_state.add_node("initialize", initialize_chat_state)
 #     should_accept_answer,
 #     {"accept": END, "reject": "agent_decision"},
 # )
+# 使用完整的 Multi-Agent 架構節點
+agent_state.add_node("orchestrator", agent_decision)  # 重命名為 orchestrator
+agent_state.add_node("executor", execute_tool)  # 重命名為 executor
+agent_state.add_node("refiner", synthesize_answer)  # 使用完整的 synthesize_answer，重命名為 refiner
+
+# 保持簡化節點以向後兼容（如果需要）
 agent_state.add_node("synthesize", synthesize_answer_node)
 agent_state.add_node("use_tools", use_tools_node)
-agent_state.add_node("execute_tool", execute_tool)
 
 agent_state.add_edge(START, "initialize")
-agent_state.add_edge("initialize", "use_tools")
+agent_state.add_edge("initialize", "orchestrator")  # 使用完整的 Orchestrator
+
+# Orchestrator 路由
 agent_state.add_conditional_edges(
-    "use_tools",
-    lambda state: "execute_tool"
-    if state.get("current_decision").get("tool_name")
-    else "synthesize",
+    "orchestrator",
+    route_decision,  # 根據 decision.action 路由
     {
-        "synthesize": "synthesize",
-        "execute_tool": "execute_tool",
+        "use_tool": "executor",
+        "synthesize": "refiner",
+        "finish": "refiner",
     },
 )
-agent_state.add_edge("execute_tool", "synthesize")
-agent_state.add_edge("synthesize", END)
+
+# Executor -> Back to Orchestrator (Loop)
+agent_state.add_edge("executor", "orchestrator")
+
+# Refiner 決定是結束還是重來
+agent_state.add_conditional_edges(
+    "refiner",
+    should_accept_answer,  # 評估函數
+    {
+        "accept": END,
+        "reject": "orchestrator",  # 帶有 feedback 回到 Orchestrator
+    },
+)
 
 # Graph will be compiled after checkpointer is initialized
 _graph_instance = None
