@@ -359,6 +359,9 @@ class SourceResponse(BaseModel):
     command_id: Optional[str] = None
     status: Optional[str] = None
     processing_info: Optional[Dict] = None
+    # Processing status and error tracking
+    processing_status: Optional[str] = None
+    error_message: Optional[str] = None
     # Notebook associations
     notebooks: Optional[List[str]] = None
 
@@ -378,6 +381,9 @@ class SourceListResponse(BaseModel):
     command_id: Optional[str] = None
     status: Optional[str] = None
     processing_info: Optional[Dict[str, Any]] = None
+    # Processing status and error tracking
+    processing_status: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 # Context API models

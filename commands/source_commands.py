@@ -8,6 +8,7 @@ from surreal_commands import CommandInput, CommandOutput, command
 from open_notebook.database.repository import ensure_record_id
 from open_notebook.domain.notebook import Source
 from open_notebook.domain.transformation import Transformation
+from open_notebook.utils.error_utils import clean_error_message
 
 try:
     from open_notebook.graphs.source import source_graph
@@ -118,6 +119,12 @@ async def process_source_command(
             f"Created {insights_created} insights and {embedded_chunks} embedded chunks"
         )
 
+        # Update processing status to completed and clear error message
+        try:
+            await processed_source.update_processing_status("completed")
+        except Exception as status_error:
+            logger.warning(f"Failed to update processing status: {status_error}")
+
         return SourceProcessingOutput(
             success=True,
             source_id=str(processed_source.id),
@@ -131,9 +138,23 @@ async def process_source_command(
         logger.error(f"Source processing failed: {e}")
         logger.exception(e)
 
+        # Clean error message for user-friendly display
+        cleaned_error = clean_error_message(e)
+        
+        # Update source status to failed with error message
+        try:
+            source = await Source.get(input_data.source_id)
+            if source:
+                await source.update_processing_status("failed", cleaned_error)
+            else:
+                logger.warning(f"Source {input_data.source_id} not found, cannot update status")
+        except Exception as status_error:
+            logger.error(f"Failed to update source processing status: {status_error}")
+            logger.exception(status_error)
+
         return SourceProcessingOutput(
             success=False,
             source_id=input_data.source_id,
             processing_time=processing_time,
-            error_message=str(e),
+            error_message=cleaned_error,
         )

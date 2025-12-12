@@ -367,10 +367,14 @@ async def get_sources(
                     insights_count=row.get("insights_count", 0),
                     created=str(row["created"]),
                     updated=str(row["updated"]),
+                    processing_status=row.get("processing_status"),
+                    error_message=row.get("error_message"),
                     # Status fields
                     command_id=command_id,
                     status=status,
                     processing_info=processing_info,
+                    processing_status=row.get("processing_status"),
+                    error_message=row.get("error_message"),
                 )
             )
 
@@ -513,6 +517,8 @@ async def create_source(
                     command_id=command_id,
                     status="new",
                     processing_info={"async": True, "queued": True},
+                    processing_status=source.processing_status or "pending",
+                    error_message=source.error_message,
                 )
 
             except Exception as e:
@@ -615,10 +621,14 @@ async def create_source(
                     else None,
                     full_text=processed_source.full_text,
                     embedded=embedded_chunks > 0,
+                    processing_status=processed_source.processing_status,
+                    error_message=processed_source.error_message,
                     embedded_chunks=embedded_chunks,
                     created=str(processed_source.created),
                     updated=str(processed_source.updated),
                     # No command_id or status for sync processing (legacy behavior)
+                    processing_status=processed_source.processing_status,
+                    error_message=processed_source.error_message,
                 )
 
             except Exception as e:
@@ -813,6 +823,8 @@ async def get_source(source_id: str):
             command_id=str(source.command) if source.command else None,
             status=status,
             processing_info=processing_info,
+            processing_status=source.processing_status,
+            error_message=source.error_message,
             # Notebook associations
             notebooks=notebook_ids,
         )
@@ -947,6 +959,8 @@ async def update_source(source_id: str, source_update: SourceUpdate):
             embedded_chunks=embedded_chunks,
             created=str(source.created),
             updated=str(source.updated),
+            processing_status=source.processing_status,
+            error_message=source.error_message,
         )
     except HTTPException:
         raise
@@ -1037,8 +1051,10 @@ async def retry_source_processing(source_id: str):
                 f"Submitted retry processing command: {command_id} for source {source_id}"
             )
 
-            # Update source with new command ID
+            # Update source with new command ID and clear error status
             source.command = ensure_record_id(f"command:{command_id}")
+            # Clear error message and set status to pending
+            await source.update_processing_status("pending")
             await source.save()
 
             # Get current embedded chunks count
@@ -1063,6 +1079,8 @@ async def retry_source_processing(source_id: str):
                 command_id=command_id,
                 status="queued",
                 processing_info={"retry": True, "queued": True},
+                processing_status=source.processing_status or "pending",
+                error_message=source.error_message,
             )
 
         except Exception as e:

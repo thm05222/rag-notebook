@@ -6,6 +6,9 @@ and build context from sources, notebooks, and insights.
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
@@ -22,16 +25,35 @@ class ContextItem:
     """Represents a single item in the context."""
     
     id: str
-    type: Literal["source", "insight"]
+    type: Literal["source", "insight", "search_result", "tool_output"]
     content: Dict[str, Any]
     priority: int = 0
     token_count: Optional[int] = None
     
     def __post_init__(self):
-        """Calculate token count for the content if not provided."""
+        """Calculate token count smartly based on content type."""
         if self.token_count is None:
-            content_str = str(self.content)
-            self.token_count = token_count(content_str)
+            text_to_count = ""
+            
+            if self.type == "search_result":
+                # For search results, only count meaningful text fields
+                if "content" in self.content:
+                    text_to_count += str(self.content.get("content", ""))
+                if "title" in self.content:
+                    text_to_count += f" {self.content.get('title', '')}"
+                # For PageIndex results, extract summary, title, and text
+                if "summary" in self.content:
+                    text_to_count += f" {self.content.get('summary', '')}"
+                if "text" in self.content:
+                    text_to_count += f" {self.content.get('text', '')}"
+                # If no meaningful fields found, fallback to minimal representation
+                if not text_to_count.strip():
+                    text_to_count = json.dumps(self.content, ensure_ascii=False)
+            else:
+                # For other types, use JSON representation but it's already structured
+                text_to_count = json.dumps(self.content, ensure_ascii=False)
+            
+            self.token_count = token_count(text_to_count)
 
 
 @dataclass
@@ -91,8 +113,13 @@ class ContextBuilder:
 
         # Items storage
         self.items: List[ContextItem] = []
+        
+        # Concurrency control: Semaphore for limiting concurrent source processing
+        # Default to 15, can be overridden via environment variable
+        max_concurrent = int(os.getenv("CONTEXT_BUILDER_MAX_CONCURRENT", "15"))
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
-        logger.debug(f"ContextBuilder initialized with params: {list(kwargs.keys())}")
+        logger.debug(f"ContextBuilder initialized with params: {list(kwargs.keys())}, max_concurrent={max_concurrent}")
     
     async def build(self) -> Dict[str, Any]:
         """
@@ -139,6 +166,9 @@ class ContextBuilder:
         """
         Add source and its insights to context.
         
+        Allows partial failures - logs warnings but doesn't raise exceptions
+        to allow processing of other sources to continue.
+        
         Args:
             source_id: ID of the source
             inclusion_level: "insights", "full content", or "not in"
@@ -174,33 +204,45 @@ class ContextBuilder:
             
             # Add insights if requested and available
             if self.include_insights and "insights" in inclusion_level:
-                insights = await source.get_insights()
-                for insight in insights:
-                    insight_priority = (self.context_config.priority_weights or {}).get("insight", 75)
-                    insight_item = ContextItem(
-                        id=insight.id or "",
-                        type="insight",
-                        content={
-                            "id": insight.id,
-                            "source_id": source.id,
-                            "insight_type": insight.insight_type,
-                            "content": insight.content
-                        },
-                        priority=insight_priority
+                try:
+                    insights = await source.get_insights()
+                    for insight in insights:
+                        insight_priority = (self.context_config.priority_weights or {}).get("insight", 75)
+                        insight_item = ContextItem(
+                            id=insight.id or "",
+                            type="insight",
+                            content={
+                                "id": insight.id,
+                                "source_id": source.id,
+                                "insight_type": insight.insight_type,
+                                "content": insight.content
+                            },
+                            priority=insight_priority
+                        )
+                        self.add_item(insight_item)
+                except Exception as insight_error:
+                    # Log but continue - source context was added successfully
+                    logger.warning(
+                        f"Failed to add insights for source {source_id}: {insight_error}"
                     )
-                    self.add_item(insight_item)
             
             logger.debug(f"Added source context for {source_id}")
             
         except NotFoundError:
             logger.warning(f"Source {source_id} not found")
         except Exception as e:
-            logger.error(f"Error adding source context for {source_id}: {str(e)}")
-            raise
+            # Changed from raise to warning - allow partial failures
+            logger.warning(
+                f"Failed to add context for source {source_id}: {e}. "
+                f"Continuing with other sources."
+            )
+            # Don't raise - allow processing to continue
     
     async def _add_notebook_context(self, notebook_id: str) -> None:
         """
         Add notebook content based on context configuration.
+        
+        Uses concurrent processing with Semaphore to limit parallel requests.
         
         Args:
             notebook_id: ID of the notebook
@@ -210,18 +252,60 @@ class ContextBuilder:
             if not notebook:
                 raise NotFoundError(f"Notebook {notebook_id} not found")
             
+            # Wrapper function to safely add source context with semaphore control
+            async def safe_add_source(source_id: str, inclusion_level: str = "insights") -> None:
+                """Add source context with semaphore-controlled concurrency."""
+                async with self._semaphore:
+                    try:
+                        await self._add_source_context(source_id, inclusion_level)
+                    except Exception as e:
+                        # Log but don't raise - allow partial failures
+                        logger.warning(
+                            f"Failed to add context for source {source_id} "
+                            f"in notebook {notebook_id}: {e}"
+                        )
+                        # Re-raise to be caught by gather's return_exceptions
+                        raise
+            
             # Process sources from context config or get all
             config_sources = self.context_config.sources
+            tasks = []
+            
             if config_sources:
+                # Collect tasks from config
                 for source_id, status in config_sources.items():
-                    await self._add_source_context(source_id, status)
+                    tasks.append(safe_add_source(source_id, status))
             else:
                 # Default: get all sources with insights
                 sources = await notebook.get_sources()
                 for source in sources:
                     if source.id:
-                        await self._add_source_context(source.id, "insights")
-
+                        tasks.append(safe_add_source(source.id, "insights"))
+            
+            # Execute all tasks concurrently with exception handling
+            if tasks:
+                import time
+                start_time = time.time()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Count successes and failures
+                success_count = sum(1 for r in results if not isinstance(r, Exception))
+                failure_count = len(results) - success_count
+                duration = time.time() - start_time
+                
+                if failure_count > 0:
+                    logger.warning(
+                        f"Notebook {notebook_id}: Processed {success_count}/{len(tasks)} sources "
+                        f"successfully in {duration:.2f}s ({failure_count} failed)"
+                    )
+                else:
+                    logger.info(
+                        f"Notebook {notebook_id}: Processed {success_count} sources "
+                        f"successfully in {duration:.2f}s"
+                    )
+            else:
+                logger.debug(f"Notebook {notebook_id} has no sources to process")
+            
             logger.debug(f"Added notebook context for {notebook_id}")
             
         except Exception as e:
@@ -247,17 +331,78 @@ class ContextBuilder:
         self.items.append(item)
         logger.debug(f"Added item {item.id} with priority {item.priority}")
     
+    def add_search_results(
+        self, 
+        results: List[Dict[str, Any]], 
+        search_type: str = "vector",
+        max_results: int = 10
+    ) -> None:
+        """
+        Add search results from tools (Vector or PageIndex) to context.
+        
+        These usually have higher priority than static source content.
+        
+        Args:
+            results: List of search result dictionaries
+            search_type: Type of search ("vector" or "pageindex")
+            max_results: Maximum number of results to add (default: 10)
+        """
+        base_priority = 150  # Higher than source (100)
+        
+        # Limit results to avoid filling entire context window
+        limited_results = results[:max_results]
+        
+        if len(results) > max_results:
+            logger.info(
+                f"Limiting search results from {len(results)} to {max_results} "
+                f"to avoid filling entire context window"
+            )
+        
+        for result in limited_results:
+            # Handle PageIndex special structure
+            if search_type == "pageindex":
+                content = {
+                    "type": "pageindex_node",
+                    "title": result.get("title"),
+                    "content": result.get("content") or result.get("summary"),
+                    "text": result.get("text"),
+                    "metadata": result.get("metadata", {}),  # Preserve page numbers, sections, etc.
+                    "source_id": result.get("source_id"),
+                    "source_title": result.get("source_title"),
+                }
+            else:
+                # Vector search results - use as is
+                content = result
+            
+            # Calculate priority based on similarity score if available
+            similarity = result.get("similarity", 0.0)
+            priority = base_priority + int(similarity * 10)  # Higher similarity = higher priority
+            
+            item = ContextItem(
+                id=f"{search_type}:{result.get('id', 'unknown')}",
+                type="search_result",
+                content=content,
+                priority=priority
+            )
+            self.add_item(item)
+        
+        logger.info(f"Added {len(limited_results)} search results from {search_type} search")
+    
     def prioritize(self) -> None:
         """Sort items by priority (higher priority first)."""
         self.items.sort(key=lambda x: x.priority, reverse=True)
         logger.debug(f"Prioritized {len(self.items)} items")
     
-    def truncate_to_fit(self, max_tokens: int) -> None:
+    def truncate_to_fit(self, max_tokens: int, min_source_ratio: float = 0.2) -> None:
         """
         Remove items if total token count exceeds limit.
         
+        Implements a safety mechanism to ensure at least a minimum ratio
+        of Source Content is preserved to avoid RAG degradation.
+        
         Args:
             max_tokens: Maximum allowed tokens
+            min_source_ratio: Minimum ratio of source content to preserve (default: 0.2 = 20%)
         """
         if not max_tokens:
             return
@@ -270,16 +415,64 @@ class ContextBuilder:
         
         logger.info(f"Truncating from {total_tokens} to {max_tokens} tokens")
         
-        # Remove items from the end (lowest priority) until under limit
+        # Group items by type for safety mechanism
+        items_by_type: Dict[str, List[ContextItem]] = {
+            "source": [],
+            "insight": [],
+            "search_result": [],
+            "tool_output": []
+        }
+        
+        for item in self.items:
+            items_by_type[item.type].append(item)
+        
+        # Calculate minimum tokens to preserve for sources
+        source_tokens = sum(item.token_count or 0 for item in items_by_type["source"])
+        min_source_tokens = int(source_tokens * min_source_ratio)
+        
+        # Sort all items by priority (lowest first for removal)
+        sorted_items = sorted(self.items, key=lambda x: x.priority)
+        
         current_tokens = total_tokens
         removed_count = 0
+        removed_by_type: Dict[str, int] = {t: 0 for t in items_by_type.keys()}
+        preserved_source_tokens = source_tokens
         
-        while current_tokens > max_tokens and self.items:
-            removed_item = self.items.pop()
-            current_tokens -= (removed_item.token_count or 0)
+        # Remove items from lowest priority, but ensure minimum source content
+        for item in sorted_items:
+            if current_tokens <= max_tokens:
+                break
+            
+            item_tokens = item.token_count or 0
+            
+            # Safety check: don't remove if it would violate minimum source ratio
+            if item.type == "source":
+                if preserved_source_tokens - item_tokens < min_source_tokens:
+                    logger.debug(
+                        f"Skipping removal of source {item.id} to preserve "
+                        f"minimum {min_source_ratio*100:.0f}% source content"
+                    )
+                    continue
+            
+            # Safe to remove
+            self.items.remove(item)
+            current_tokens -= item_tokens
             removed_count += 1
+            removed_by_type[item.type] += 1
+            
+            if item.type == "source":
+                preserved_source_tokens -= item_tokens
         
-        logger.info(f"Removed {removed_count} items, final token count: {current_tokens}")
+        # Log truncation statistics
+        removed_summary = ", ".join([
+            f"{count} {t}" for t, count in removed_by_type.items() if count > 0
+        ])
+        logger.info(
+            f"Truncation complete: Removed {removed_count} items ({removed_summary}), "
+            f"final token count: {current_tokens}/{max_tokens}. "
+            f"Preserved {preserved_source_tokens}/{source_tokens} source tokens "
+            f"({preserved_source_tokens/source_tokens*100:.1f}%)"
+        )
     
     def remove_duplicates(self) -> None:
         """Remove duplicate items based on ID."""
@@ -307,24 +500,43 @@ class ContextBuilder:
         # Group items by type
         sources = []
         insights = []
+        search_results = []
+        tool_outputs = []
         
         for item in self.items:
             if item.type == "source":
                 sources.append(item.content)
             elif item.type == "insight":
                 insights.append(item.content)
+            elif item.type == "search_result":
+                search_results.append(item.content)
+            elif item.type == "tool_output":
+                tool_outputs.append(item.content)
         
         # Calculate total tokens
         total_tokens = sum(item.token_count or 0 for item in self.items)
         
+        # Count items by type
+        type_counts = {
+            "source": len(sources),
+            "insight": len(insights),
+            "search_result": len(search_results),
+            "tool_output": len(tool_outputs)
+        }
+        
         response = {
             "sources": sources,
             "insights": insights,
+            "search_results": search_results,
+            "tool_outputs": tool_outputs,
             "total_tokens": total_tokens,
             "total_items": len(self.items),
             "metadata": {
                 "source_count": len(sources),
                 "insight_count": len(insights),
+                "search_result_count": len(search_results),
+                "tool_output_count": len(tool_outputs),
+                "type_counts": type_counts,
                 "config": {
                     "include_insights": self.include_insights,
                     "max_tokens": self.max_tokens
@@ -336,7 +548,10 @@ class ContextBuilder:
         if self.notebook_id:
             response["notebook_id"] = self.notebook_id
         
-        logger.info(f"Built context with {len(self.items)} items, {total_tokens} tokens")
+        logger.info(
+            f"Built context with {len(self.items)} items ({type_counts}), "
+            f"{total_tokens} tokens"
+        )
         
         return response
 

@@ -191,25 +191,73 @@ export function useRetrySource() {
 
   return useMutation({
     mutationFn: (sourceId: string) => sourcesApi.retry(sourceId),
+    onMutate: async (sourceId) => {
+      // Cancel any outgoing refetches (so they don't overwrite our optimistic update)
+      await queryClient.cancelQueries({ queryKey: ['sources'] })
+      await queryClient.cancelQueries({ queryKey: QUERY_KEYS.source(sourceId) })
+      await queryClient.cancelQueries({ queryKey: ['sources', sourceId, 'status'] })
+
+      // Snapshot the previous values for rollback
+      const previousSources = queryClient.getQueryData(QUERY_KEYS.sources())
+      const previousSource = queryClient.getQueryData(QUERY_KEYS.source(sourceId))
+
+      // Optimistically update the source to show processing state
+      queryClient.setQueryData(QUERY_KEYS.source(sourceId), (old: SourceResponse | undefined) => {
+        if (!old) return old
+        return {
+          ...old,
+          processing_status: 'processing',
+          error_message: undefined,
+        }
+      })
+
+      // Optimistically update sources list
+      queryClient.setQueriesData(
+        { queryKey: ['sources'] },
+        (old: SourceResponse[] | undefined) => {
+          if (!old) return old
+          return old.map(source =>
+            source.id === sourceId
+              ? {
+                  ...source,
+                  processing_status: 'processing',
+                  error_message: undefined,
+                }
+              : source
+          )
+        }
+      )
+
+      // Return context with previous values for rollback
+      return { previousSources, previousSource }
+    },
+    onError: (err, sourceId, context) => {
+      // Rollback on error
+      if (context?.previousSource) {
+        queryClient.setQueryData(QUERY_KEYS.source(sourceId), context.previousSource)
+      }
+      if (context?.previousSources) {
+        queryClient.setQueryData(QUERY_KEYS.sources(), context.previousSources)
+      }
+
+      toast({
+        title: 'Retry Failed',
+        description: 'Failed to retry source processing. Please try again.',
+        variant: 'destructive',
+      })
+    },
     onSuccess: (result, sourceId) => {
       // Invalidate status query to refetch latest status
       queryClient.invalidateQueries({
         queryKey: ['sources', sourceId, 'status']
       })
-      // Invalidate ALL sources queries to refresh the UI
+      // Invalidate ALL sources queries to refresh the UI with actual data
       queryClient.invalidateQueries({ queryKey: ['sources'] })
       queryClient.invalidateQueries({ queryKey: QUERY_KEYS.source(sourceId) })
 
       toast({
         title: 'Source Retry Queued',
         description: 'The source has been requeued for processing.',
-      })
-    },
-    onError: () => {
-      toast({
-        title: 'Retry Failed',
-        description: 'Failed to retry source processing. Please try again.',
-        variant: 'destructive',
       })
     },
   })

@@ -23,13 +23,19 @@ import {
   CheckCircle,
   AlertTriangle,
   Loader2,
-  Unlink
+  Unlink,
+  AlertCircle
 } from 'lucide-react'
 import { useSourceStatus, useBuildPageIndex } from '@/lib/hooks/use-sources'
 import { cn } from '@/lib/utils'
 import { ContextToggle } from '@/components/common/ContextToggle'
 import { ContextMode } from '@/app/(dashboard)/notebooks/[id]/page'
 import { FileSearch } from 'lucide-react'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 
 interface SourceCardProps {
   source: SourceListResponse
@@ -198,13 +204,15 @@ export function SourceCard({
   }
 
   const isProcessing: boolean = currentStatus === 'new' || currentStatus === 'running' || currentStatus === 'queued'
-  const isFailed: boolean = currentStatus === 'failed'
+  const isFailed: boolean = currentStatus === 'failed' || source.processing_status === 'failed'
   const isCompleted: boolean = currentStatus === 'completed'
+  const errorMessage = source.error_message || sourceWithStatus.error_message
 
   return (
     <Card
       className={cn(
         'transition-all duration-200 hover:shadow-md group relative cursor-pointer border border-border/60 dark:border-border/40',
+        isFailed && 'border-red-300 bg-red-50 dark:border-red-800 dark:bg-red-950/20',
         className
       )}
       onClick={handleCardClick}
@@ -227,6 +235,18 @@ export function SourceCard({
                   )} />
                   {statusLoading && shouldFetchStatus ? 'Checking...' : statusConfig.label}
                 </div>
+                
+                {/* Error icon with tooltip for failed status */}
+                {isFailed && errorMessage && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <AlertCircle className="h-4 w-4 text-red-600 cursor-help" />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs">
+                      <p className="text-sm text-red-500">{errorMessage}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                )}
 
                 {/* Source type indicator */}
                 <div className="flex items-center gap-1 text-gray-500">
@@ -251,6 +271,15 @@ export function SourceCard({
               <p className="text-xs text-gray-600 mb-2 italic">
                 {statusData.message}
               </p>
+            )}
+            
+            {/* Error message display for failed status */}
+            {isFailed && errorMessage && (
+              <div className="mb-2 p-2 bg-red-100 dark:bg-red-900/20 rounded-md border border-red-200 dark:border-red-800">
+                <p className="text-xs text-red-700 dark:text-red-400 line-clamp-2">
+                  {errorMessage.length > 150 ? `${errorMessage.substring(0, 150)}...` : errorMessage}
+                </p>
+              </div>
             )}
 
             {/* Metadata badges */}

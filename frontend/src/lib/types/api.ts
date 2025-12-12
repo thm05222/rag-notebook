@@ -26,6 +26,9 @@ export interface SourceListResponse {
   command_id?: string
   status?: string
   processing_info?: Record<string, unknown>
+  // Processing status and error tracking
+  processing_status?: string
+  error_message?: string
 }
 
 export interface SourceDetailResponse extends SourceListResponse {

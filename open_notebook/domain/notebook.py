@@ -309,6 +309,15 @@ class Source(ObjectModel):
     pageindex_version: Optional[str] = Field(
         default=None, description="PageIndex version for compatibility"
     )
+    # Processing status and error tracking
+    processing_status: Optional[str] = Field(
+        default=None, 
+        description="Processing status: pending, processing, completed, failed"
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description="User-friendly error message if processing failed"
+    )
 
     class Config:
         arbitrary_types_allowed = True
@@ -321,6 +330,62 @@ class Source(ObjectModel):
             return ensure_record_id(value)
         return value
 
+    @field_validator("processing_status", mode="before")
+    @classmethod
+    def validate_processing_status(cls, value):
+        """Validate processing_status is one of the allowed values."""
+        if value is None:
+            return None
+        allowed_statuses = {"pending", "processing", "completed", "failed"}
+        if value not in allowed_statuses:
+            logger.warning(
+                f"Invalid processing_status '{value}', must be one of {allowed_statuses}. "
+                f"Defaulting to None."
+            )
+            return None
+        return value
+    
+    @field_validator("error_message", mode="before")
+    @classmethod
+    def validate_error_message(cls, value):
+        """Limit error_message length to 500 characters."""
+        if value is None:
+            return None
+        if len(value) > 500:
+            logger.warning(f"error_message truncated from {len(value)} to 500 characters")
+            return value[:500]
+        return value
+    
+    async def update_processing_status(
+        self, 
+        status: str, 
+        error_message: Optional[str] = None
+    ) -> None:
+        """
+        Update processing status and error message.
+        
+        Args:
+            status: Processing status (pending, processing, completed, failed)
+            error_message: Optional error message (will be truncated to 500 chars)
+        """
+        if status not in {"pending", "processing", "completed", "failed"}:
+            raise ValueError(f"Invalid status: {status}")
+        
+        self.processing_status = status
+        
+        if error_message:
+            # Truncate to 500 characters
+            if len(error_message) > 500:
+                error_message = error_message[:500]
+            self.error_message = error_message
+        elif status == "completed":
+            # Clear error message on success
+            self.error_message = None
+        
+        # Save to database
+        await self.save()
+        logger.debug(f"Updated processing status for source {self.id}: {status}")
+    
     @field_validator("id", mode="before")
     @classmethod
     def parse_id(cls, value):

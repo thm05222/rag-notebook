@@ -28,6 +28,9 @@ DEFINE FIELD pageindex_structure ON TABLE source FLEXIBLE TYPE option<object>;
 DEFINE FIELD pageindex_built_at ON TABLE source TYPE option<datetime>;
 DEFINE FIELD pageindex_model ON TABLE source TYPE option<string>;
 DEFINE FIELD pageindex_version ON TABLE source TYPE option<string>;
+-- Processing status and error tracking
+DEFINE FIELD processing_status ON TABLE source TYPE option<string>;
+DEFINE FIELD error_message ON TABLE source TYPE option<string>;
 
 -- Transformation table
 DEFINE TABLE transformation SCHEMAFULL;
