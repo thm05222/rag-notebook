@@ -552,7 +552,7 @@ def _categorize_tool(tool_name: str) -> str:
     parser = PydanticOutputParser(pydantic_object=Decision)
     prompt_data["format_instructions"] = parser.get_format_instructions()
     system_prompt = Prompter(
-        prompt_template="chat_agentic/decision", parser=parser
+        prompt_template="chat_agentic/orchestrator", parser=parser
     ).render(data=prompt_data)
 
     # Track tokens
@@ -599,7 +599,7 @@ def _categorize_tool(tool_name: str) -> str:
                     prompt_data["parse_error"] = str(e)
                     prompt_data["previous_attempt"] = cleaned_content[:500]  # 保留前500字符作為參考
                     system_prompt = Prompter(
-                        prompt_template="chat_agentic/decision", parser=parser
+                        prompt_template="chat_agentic/orchestrator", parser=parser
                     ).render(data=prompt_data)
                     
                     # 重新生成
@@ -1371,7 +1371,7 @@ async def refine_query(
 
     parser = PydanticOutputParser(pydantic_object=Decision)
     system_prompt = Prompter(
-        prompt_template="chat_agentic/refinement", parser=parser
+        prompt_template="chat_agentic/self_correction", parser=parser
     ).render(data=prompt_data)
 
     try:
@@ -1513,7 +1513,7 @@ async def synthesize_answer(
         "conversation_context": state.get("conversation_context", []),
     }
 
-    system_prompt = Prompter(prompt_template="chat_agentic/synthesis").render(
+    system_prompt = Prompter(prompt_template="chat_agentic/refiner").render(
         data=prompt_data
     )
 
