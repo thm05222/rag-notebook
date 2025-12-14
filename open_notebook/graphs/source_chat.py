@@ -4,7 +4,13 @@ from typing import Annotated, Dict, List, Optional
 from ai_prompter import Prompter
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.sqlite import SqliteSaver
+
+# Try new import path first (langgraph-checkpoint-sqlite 2.0+), fallback to old path
+try:
+    from langgraph_checkpoint_sqlite import SqliteSaver
+except ImportError:
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict

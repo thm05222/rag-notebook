@@ -15,7 +15,13 @@ from ai_prompter import Prompter
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.output_parsers.pydantic import PydanticOutputParser
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+# Try new import path first (langgraph-checkpoint-sqlite 2.0+), fallback to old path
+try:
+    from langgraph_checkpoint_sqlite.aio import AsyncSqliteSaver
+except ImportError:
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from loguru import logger
@@ -341,6 +347,23 @@ def detect_circular_reasoning(state: ChatAgenticState) -> bool:
     return False
 
 
+
+def _categorize_tool(tool_name: str) -> str:
+    """將工具分類為：local_search, external_api, pageindex, calculation, etc."""
+    tool_name_lower = tool_name.lower()
+    if "pageindex" in tool_name_lower or "page_index" in tool_name_lower:
+        return "pageindex"
+    elif "vector" in tool_name_lower or "text" in tool_name_lower:
+        return "local_search"
+    elif "::" in tool_name or "mcp" in tool_name_lower:
+        return "external_api"
+    elif "calculation" in tool_name_lower or "calc" in tool_name_lower:
+        return "calculation"
+    elif "internet" in tool_name_lower or "search" in tool_name_lower:
+        return "internet_search"
+    else:
+        return "other"
+
 async def agent_decision(
     state: ChatAgenticState, config: RunnableConfig
 ) -> Dict[str, Any]:
@@ -502,23 +525,6 @@ async def agent_decision(
         enhanced_tools.append(enhanced_tool)
     
     available_tools = enhanced_tools
-
-
-def _categorize_tool(tool_name: str) -> str:
-    """將工具分類為：local_search, external_api, pageindex, calculation, etc."""
-    tool_name_lower = tool_name.lower()
-    if "pageindex" in tool_name_lower or "page_index" in tool_name_lower:
-        return "pageindex"
-    elif "vector" in tool_name_lower or "text" in tool_name_lower:
-        return "local_search"
-    elif "::" in tool_name or "mcp" in tool_name_lower:
-        return "external_api"
-    elif "calculation" in tool_name_lower or "calc" in tool_name_lower:
-        return "calculation"
-    elif "internet" in tool_name_lower or "search" in tool_name_lower:
-        return "internet_search"
-    else:
-        return "other"
 
     # Prepare decision prompt data
     # 包含錯誤歷史，讓 Agent 知道哪些工具失敗了（關鍵修復）
