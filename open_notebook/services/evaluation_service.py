@@ -194,7 +194,7 @@ class EvaluationService:
         stage1_model = await provision_langchain_model(
             stage1_prompt_text,
             model_id,
-            "tools",
+            "evaluation",
             max_tokens=2000,  # 允許更長的推理過程
         )
         
@@ -223,7 +223,7 @@ class EvaluationService:
         stage2_model = await provision_langchain_model(
             stage2_prompt_text,
             stage2_model_id or model_id,
-            "tools",
+            "evaluation",
             max_tokens=1000,
             structured=dict(type="json"),  # 使用結構化輸出
         )
@@ -307,7 +307,7 @@ class EvaluationService:
             model = await provision_langchain_model(
                 system_prompt,
                 model_id,
-                "tools",
+                "evaluation",
                 max_tokens=1000,
             )
             

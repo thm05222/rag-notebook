@@ -103,7 +103,7 @@ async def call_model_with_source_context(
         str(payload),
         config.get("configurable", {}).get("model_id")
         or state.get("model_override"),
-        "chat",
+        "source_chat",
         max_tokens=8192,
     )
 

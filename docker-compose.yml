@@ -1,6 +1,8 @@
-services:
+﻿services:
     surrealdb:
         image: surrealdb/surrealdb:v2
+        ports:
+            - "8000:8000"  # WebSocket API for local development
         volumes:
             - ./surreal_data:/mydata
         environment:

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useState, useRef, useEffect, useMemo, useCallback, memo, useDeferredValue } from 'react'
 import { useQueries } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
@@ -8,7 +8,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
-import { Bot, User, Send, Loader2, FileText, Lightbulb, Clock } from 'lucide-react'
+import { Bot, User, Send, Loader2, FileText, Lightbulb, Clock, ChevronDown } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import {
   SourceChatMessage,
@@ -80,9 +80,33 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const [input, setInput] = useState('')
   const [sessionManagerOpen, setSessionManagerOpen] = useState(false)
+  const [isNearBottom, setIsNearBottom] = useState(true)
+  const [hasNewMessages, setHasNewMessages] = useState(false)
   const scrollAreaRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const { openModal } = useModalManager()
+
+  // Scroll handler to detect user position
+  const handleScroll = useCallback(() => {
+    const scrollArea = scrollAreaRef.current
+    if (!scrollArea) return
+    
+    // Get the actual scrollable viewport element from ScrollArea
+    const viewport = scrollArea.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null
+    if (!viewport) return
+    
+    const threshold = 100
+    const isAtBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < threshold
+    setIsNearBottom(isAtBottom)
+    if (isAtBottom) setHasNewMessages(false)
+  }, [])
+
+  // Scroll to bottom helper
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    setHasNewMessages(false)
+    setIsNearBottom(true)
+  }, [])
 
   // Fetch sources for notebook chat
   const { data: notebookSources = [] } = useSources(notebookId || undefined)
@@ -279,10 +303,27 @@ export function ChatPanel({
     }
   }
 
-  // Auto-scroll to bottom when new messages arrive
+  // Smart auto-scroll: only scroll if user is near bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+    if (isNearBottom) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    } else if (messages.length > 0) {
+      // User scrolled up, show "new messages" indicator
+      setHasNewMessages(true)
+    }
+  }, [messages, isNearBottom])
+
+  // Attach scroll listener to ScrollArea viewport
+  useEffect(() => {
+    const scrollArea = scrollAreaRef.current
+    if (!scrollArea) return
+
+    const viewport = scrollArea.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null
+    if (!viewport) return
+
+    viewport.addEventListener('scroll', handleScroll, { passive: true })
+    return () => viewport.removeEventListener('scroll', handleScroll)
+  }, [handleScroll])
 
   const handleSend = () => {
     if (input.trim() && !isStreaming) {
@@ -346,7 +387,7 @@ export function ChatPanel({
           )}
         </div>
       </CardHeader>
-      <CardContent className="flex-1 flex flex-col min-h-0 p-0">
+      <CardContent className="flex-1 flex flex-col min-h-0 p-0 relative">
         <ScrollArea className="flex-1 min-h-0 px-4" ref={scrollAreaRef}>
           <div className="space-y-4 py-4">
             {messages.length === 0 ? (
@@ -432,6 +473,21 @@ export function ChatPanel({
           </div>
         </ScrollArea>
 
+        {/* New Messages Button - shows when user scrolls up */}
+        {hasNewMessages && (
+          <div className="absolute bottom-[200px] left-1/2 -translate-x-1/2 z-10">
+            <Button
+              variant="secondary"
+              size="sm"
+              className="shadow-lg gap-1 animate-in fade-in slide-in-from-bottom-2"
+              onClick={scrollToBottom}
+            >
+              <ChevronDown className="h-4 w-4" />
+              New messages
+            </Button>
+          </div>
+        )}
+
         {/* Context Indicators */}
         {contextIndicators && (
           <div className="border-t px-4 py-2">
@@ -508,20 +564,32 @@ export function ChatPanel({
 }
 
 // Helper component to render AI messages with clickable references
-function AIMessageContent({
-  content,
-  onReferenceClick,
-  titleMap
-}: {
+// Memoized to reduce re-renders during streaming
+interface AIMessageContentProps {
   content: string
   onReferenceClick: (type: string, id: string) => void
   titleMap?: Map<string, string> | Record<string, string>
-}) {
-  // Convert references to compact markdown with numbered citations
-  const markdownWithCompactRefs = convertReferencesToCompactMarkdown(content, titleMap)
+}
 
-  // Create custom link component for compact references
-  const LinkComponent = createCompactReferenceLinkComponent(onReferenceClick)
+const AIMessageContent = memo(function AIMessageContent({
+  content,
+  onReferenceClick,
+  titleMap
+}: AIMessageContentProps) {
+  // Use deferred value to reduce render frequency during fast streaming updates
+  const deferredContent = useDeferredValue(content)
+  
+  // Memoize the markdown conversion for performance
+  const markdownWithCompactRefs = useMemo(
+    () => convertReferencesToCompactMarkdown(deferredContent, titleMap),
+    [deferredContent, titleMap]
+  )
+
+  // Memoize the link component to prevent recreation on each render
+  const LinkComponent = useMemo(
+    () => createCompactReferenceLinkComponent(onReferenceClick),
+    [onReferenceClick]
+  )
 
   return (
     <div className="prose prose-sm prose-neutral dark:prose-invert max-w-none break-words prose-headings:font-semibold prose-a:text-blue-600 prose-a:break-all prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-p:mb-4 prose-p:leading-7 prose-li:mb-2">
@@ -544,4 +612,4 @@ function AIMessageContent({
       </ReactMarkdown>
     </div>
   )
-}
+})

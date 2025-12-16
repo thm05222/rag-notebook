@@ -1,4 +1,9 @@
 from typing import ClassVar, Dict, Optional, Union
+from pydantic import Field
+
+# Apply langchain patch before importing esperanto
+# This fixes ModelProfile import errors in esperanto
+from open_notebook.utils.langchain_patch import *  # noqa: F401, F403
 
 from esperanto import (
     AIFactory,
@@ -31,10 +36,31 @@ class DefaultModels(RecordModel):
     record_id: ClassVar[str] = "open_notebook:default_models"
     default_chat_model: Optional[str] = None
     default_transformation_model: Optional[str] = None
-    large_context_model: Optional[str] = None
+    large_context_model: Optional[str] = None  # Deprecated: no longer used for auto-selection
     # default_vision_model: Optional[str]
     default_embedding_model: Optional[str] = None
     default_tools_model: Optional[str] = None
+    
+    # Role-specific default model type mappings
+    # Maps role names to default model types (chat, tools, transformation, embedding)
+    role_default_types: Dict[str, str] = Field(
+        default_factory=lambda: {
+            "orchestrator": "tools",
+            "executor": "tools",
+            "refiner": "chat",
+            "synthesis": "chat",
+            "evaluation": "tools",
+            "transformation": "transformation",
+            "source_chat": "chat",
+            "prompt": "transformation",
+            "strategy": "tools",
+            "answer": "tools",
+            "final_answer": "chat",
+            "decision": "tools",
+            "correction": "tools",
+            "fallback": "chat",
+        }
+    )
 
 
 class ModelManager:
@@ -215,10 +241,18 @@ class ModelManager:
     async def get_default_model(self, model_type: str, **kwargs) -> Optional[ModelType]:
         """
         Get the default model for a specific type.
+        
+        Note: This method is deprecated for new code. Use provision_langchain_model with role parameter instead.
 
         Args:
             model_type: The type of model to retrieve (e.g., 'chat', 'embedding', etc.)
             **kwargs: Additional arguments to pass to the model constructor
+        
+        Returns:
+            Model instance or None if not configured
+        
+        Raises:
+            ValueError: If model is not configured (when used via provision_langchain_model)
         """
         defaults = await self.get_defaults()
         model_id = None
@@ -226,14 +260,9 @@ class ModelManager:
         if model_type == "chat":
             model_id = defaults.default_chat_model
         elif model_type == "transformation":
-            model_id = (
-                defaults.default_transformation_model
-                or defaults.default_chat_model
-            )
+            model_id = defaults.default_transformation_model
         elif model_type == "tools":
-            model_id = (
-                defaults.default_tools_model or defaults.default_chat_model
-            )
+            model_id = defaults.default_tools_model
         elif model_type == "embedding":
             model_id = defaults.default_embedding_model
         elif model_type == "large_context":

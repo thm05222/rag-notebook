@@ -1,6 +1,10 @@
 import os
 from typing import List, Optional
 
+# Apply langchain patch before importing esperanto
+# This fixes ModelProfile import errors in esperanto
+from open_notebook.utils.langchain_patch import *  # noqa: F401, F403
+
 from esperanto import AIFactory
 from fastapi import APIRouter, HTTPException, Query
 from loguru import logger

@@ -373,8 +373,6 @@ async def get_sources(
                     command_id=command_id,
                     status=status,
                     processing_info=processing_info,
-                    processing_status=row.get("processing_status"),
-                    error_message=row.get("error_message"),
                 )
             )
 
@@ -627,8 +625,6 @@ async def create_source(
                     created=str(processed_source.created),
                     updated=str(processed_source.updated),
                     # No command_id or status for sync processing (legacy behavior)
-                    processing_status=processed_source.processing_status,
-                    error_message=processed_source.error_message,
                 )
 
             except Exception as e:

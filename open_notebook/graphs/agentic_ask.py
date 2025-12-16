@@ -168,7 +168,7 @@ async def agent_decision(state: AgenticAskState, config: RunnableConfig) -> Dict
         model = await provision_langchain_model(
             system_prompt,
             config.get("configurable", {}).get("decision_model"),
-            "tools",
+            "decision",
             max_tokens=2000,
             structured=dict(type="json"),
         )
@@ -331,7 +331,7 @@ async def refine_query(state: AgenticAskState, config: RunnableConfig) -> Dict[s
         model = await provision_langchain_model(
             system_prompt,
             config.get("configurable", {}).get("decision_model"),
-            "tools",
+            "decision",
             max_tokens=1000,
             structured=dict(type="json"),
         )
@@ -374,7 +374,7 @@ async def synthesize_answer(state: AgenticAskState, config: RunnableConfig) -> D
         model = await provision_langchain_model(
             system_prompt,
             config.get("configurable", {}).get("synthesis_model"),
-            "tools",
+            "synthesis",
             max_tokens=4000,
         )
 

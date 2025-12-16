@@ -12,6 +12,9 @@ import {
   UpdateSourceChatSessionRequest
 } from '@/lib/types/api'
 
+// Timeout for streaming requests (2 minutes - LLM responses can be slow)
+const STREAM_TIMEOUT_MS = 120000
+
 export function useSourceChat(sourceId: string) {
   const queryClient = useQueryClient()
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
@@ -19,6 +22,7 @@ export function useSourceChat(sourceId: string) {
   const [isStreaming, setIsStreaming] = useState(false)
   const [contextIndicators, setContextIndicators] = useState<SourceChatContextIndicator | null>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null)
 
   // Fetch sessions
   const { data: sessions = [], isLoading: loadingSessions, refetch: refetchSessions } = useQuery<SourceChatSession[]>({

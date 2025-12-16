@@ -25,7 +25,7 @@ async def call_model(state: dict, config: RunnableConfig) -> dict:
     chain = await provision_langchain_model(
         str(payload),
         config.get("configurable", {}).get("model_id"),
-        "transformation",
+        "prompt",
         max_tokens=5000,
     )
 

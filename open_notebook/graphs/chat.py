@@ -572,7 +572,7 @@ async def agent_decision(
         model = await provision_langchain_model(
             system_prompt,
             model_id,
-            "tools",
+            "orchestrator",
             max_tokens=2000,
             structured=dict(type="json"),
         )
@@ -1387,7 +1387,7 @@ async def refine_query(
         model = await provision_langchain_model(
             system_prompt,
             model_id,
-            "tools",
+            "correction",
             max_tokens=1000,
             structured=dict(type="json"),
         )
@@ -1530,7 +1530,7 @@ async def synthesize_answer(
         model = await provision_langchain_model(
             system_prompt,
             model_id,
-            "chat",
+            "refiner",
             max_tokens=4000,
         )
 
@@ -1958,7 +1958,7 @@ async def ainvoke_for_answer(model_id: Any, system_prompt: str):
     model = await provision_langchain_model(
         system_prompt,
         model_id,
-        "tools",
+        "refiner",
         max_tokens=2000,
         structured=dict(type="json"),
     )

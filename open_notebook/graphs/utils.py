@@ -1,55 +1,58 @@
+# Apply langchain patch before importing esperanto
+# This fixes ModelProfile import errors in esperanto
+from open_notebook.utils.langchain_patch import *  # noqa: F401, F403
+
+from typing import Optional
+
 from esperanto import LanguageModel
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_anthropic import ChatAnthropic
 from loguru import logger
 
 from open_notebook.domain.models import model_manager
-from open_notebook.utils import token_count
 
 
 async def provision_langchain_model(
     content, model_id, default_type, **kwargs
 ) -> BaseChatModel:
     """
-    Returns the best model to use based on the context size and on whether there is a specific model being requested in Config.
-    If context > 105_000, returns the large_context_model
-    If model_id is specified in Config, returns that model
-    Otherwise, returns the default model for the given type
-    """
-    tokens = token_count(content)
-
-    if tokens > 105_000:
-        logger.debug(
-            f"Using large context model because the content has {tokens} tokens"
-        )
-        model = await model_manager.get_default_model("large_context", **kwargs)
-    elif model_id:
-        model = await model_manager.get_model(model_id, **kwargs)
-    else:
-        model = await model_manager.get_default_model(default_type, **kwargs)
-
-    logger.debug(f"Using model: {model}")
+    Get model instance based on configuration.
     
-    # Check if model is None and provide helpful error message
+    Args:
+        content: Input content (for logging purposes only, no longer used for token-based model selection)
+        model_id: Specified model ID. If None, will be retrieved from role default configuration.
+        role: Role name (orchestrator, executor, refiner, etc.) - used to look up default model type from config
+        **kwargs: Additional model parameters
+    
+    Returns:
+        BaseChatModel instance
+    
+    Raises:
+        ValueError: If model is not configured for the specified role
+    """
+    # If model_id is not specified, get default model type from role configuration
+    if model_id is None:
+        defaults = await model_manager.get_defaults()
+        role_types = defaults.role_default_types or {}
+        default_type = role_types.get(role)
+        
+        if default_type:
+            model_id = getattr(defaults, f"default_{default_type}_model", None)
+        
+        if not model_id:
+            raise ValueError(
+                f"Model not configured for role '{role}'. "
+                f"Please configure a model in Settings > Models."
+            )
+    
+    # Get model directly, no automatic selection logic
+    model = await model_manager.get_model(model_id, **kwargs)
+    
     if model is None:
-        if model_id:
-            raise ValueError(
-                f"Model with ID '{model_id}' not found. Please check your model configuration."
-            )
-        elif tokens > 105_000:
-            raise ValueError(
-                f"No large context model configured. Please set a large_context_model in your default models configuration."
-            )
-        else:
-            model_type_display = {
-                "chat": "chat model",
-                "transformation": "transformation model",
-                "tools": "tools model",
-                "embedding": "embedding model",
-            }.get(default_type, default_type)
-            raise ValueError(
-                f"No default {model_type_display} configured. Please set a default_{default_type}_model in your default models configuration."
-            )
+        raise ValueError(
+            f"Model with ID '{model_id}' not found for role '{role}'. "
+            f"Please check your model configuration."
+        )
     
     assert isinstance(model, LanguageModel), f"Model is not a LanguageModel: {model}"
     langchain_model = model.to_langchain()

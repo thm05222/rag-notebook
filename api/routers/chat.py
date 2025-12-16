@@ -431,7 +431,7 @@ async def generate_fallback_answer(
             model = await provision_langchain_model(
                 system_prompt,
                 None,  # 使用默認模型
-                "chat",
+                "fallback",
                 max_tokens=3000,
             )
             
