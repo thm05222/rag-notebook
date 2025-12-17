@@ -224,3 +224,13 @@ export interface BuildContextResponse {
   token_count: number
   char_count: number
 }
+
+export interface ChatStreamEvent {
+  type: 'thought' | 'content' | 'error' | 'complete'
+  stage?: 'planning' | 'executing' | 'synthesizing'
+  content?: string
+  metadata?: Record<string, unknown>
+  message?: string
+  timestamp?: number
+  final_answer?: string
+}

@@ -1,7 +1,10 @@
 import asyncio
-from typing import Any, Dict, List, Optional
+import json
+import time
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -686,9 +689,187 @@ def build_thinking_process_from_state(state: Dict[str, Any]) -> Optional[AgentTh
     )
 
 
-@router.post("/chat/execute", response_model=ExecuteChatResponse)
+def build_thought_event(
+    stage: str, content: str, metadata: Optional[Dict[str, Any]] = None
+) -> str:
+    """構建思考事件（SSE 格式）"""
+    event_data = {
+        "type": "thought",
+        "stage": stage,
+        "content": content,
+        "timestamp": time.time(),
+    }
+    if metadata:
+        event_data["metadata"] = metadata
+    return f"data: {json.dumps(event_data)}\n\n"
+
+
+def build_content_event(content: str) -> str:
+    """構建內容事件（SSE 格式）"""
+    event_data = {
+        "type": "content",
+        "content": content,
+    }
+    return f"data: {json.dumps(event_data)}\n\n"
+
+
+def build_error_event(message: str) -> str:
+    """構建錯誤事件（SSE 格式）"""
+    event_data = {
+        "type": "error",
+        "message": message,
+    }
+    return f"data: {json.dumps(event_data)}\n\n"
+
+
+def build_complete_event(final_answer: Optional[str] = None) -> str:
+    """構建完成事件（SSE 格式）"""
+    event_data = {
+        "type": "complete",
+    }
+    if final_answer:
+        event_data["final_answer"] = final_answer
+    return f"data: {json.dumps(event_data)}\n\n"
+
+
+async def stream_chat_response(
+    request: ExecuteChatRequest,
+    session: ChatSession,
+    model_override: Optional[str],
+    graph_input: Dict[str, Any],
+    config_dict: Dict[str, Any],
+) -> AsyncGenerator[str, None]:
+    """串流聊天響應生成器"""
+    chat_graph = get_graph()
+    start_time = time.time()
+    final_answer = None
+    
+    try:
+        async for event in chat_graph.astream_events(
+            input=graph_input,
+            config=config_dict,
+            version="v2",
+            include_names=["orchestrator", "executor", "refiner"],
+        ):
+            event_type = event.get("event")
+            name = event.get("name")
+            tags = event.get("tags", [])
+            data = event.get("data", {})
+            
+            # 捕獲 Orchestrator 決策
+            if event_type == "on_chain_end" and name == "orchestrator":
+                output = data.get("output", {})
+                if isinstance(output, dict):
+                    decision = output.get("current_decision", {})
+                    if decision:
+                        reasoning = decision.get("reasoning", "")
+                        action = decision.get("action", "")
+                        tool_name = decision.get("tool_name")
+                        
+                        content = f"決策: {action}"
+                        if tool_name:
+                            content += f" | 工具: {tool_name}"
+                        if reasoning:
+                            content += f"\n推理: {reasoning[:200]}..." if len(reasoning) > 200 else f"\n推理: {reasoning}"
+                        
+                        yield build_thought_event(
+                            stage="planning",
+                            content=content,
+                            metadata={
+                                "action": action,
+                                "tool_name": tool_name,
+                                "reasoning": reasoning,
+                                "parameters": decision.get("parameters", {}),
+                            },
+                        )
+            
+            # 捕獲工具執行開始
+            elif event_type == "on_tool_start":
+                tool_name = data.get("name", "unknown")
+                input_data = data.get("input", {})
+                query = input_data.get("query", "") if isinstance(input_data, dict) else ""
+                
+                content = f"正在調用工具: {tool_name}"
+                if query:
+                    content += f"\n查詢: {query[:100]}..." if len(query) > 100 else f"\n查詢: {query}"
+                
+                yield build_thought_event(
+                    stage="executing",
+                    content=content,
+                    metadata={
+                        "tool_name": tool_name,
+                        "input": input_data,
+                    },
+                )
+            
+            # 捕獲工具執行結束
+            elif event_type == "on_tool_end":
+                tool_name = data.get("name", "unknown")
+                output = data.get("output", {})
+                
+                # 嘗試從 output 中提取結果數量
+                result_count = 0
+                if isinstance(output, dict):
+                    if "data" in output:
+                        result_count = len(output["data"]) if isinstance(output["data"], list) else 0
+                    elif "results" in output:
+                        result_count = len(output["results"]) if isinstance(output["results"], list) else 0
+                
+                success = result_count > 0 or output is not None
+                content = f"工具執行完成: {tool_name} | 成功: {success} | 結果數: {result_count}"
+                
+                yield build_thought_event(
+                    stage="executing",
+                    content=content,
+                    metadata={
+                        "tool_name": tool_name,
+                        "success": success,
+                        "result_count": result_count,
+                    },
+                )
+            
+            # 捕獲答案生成（token 流）
+            elif event_type == "on_chat_model_stream":
+                # 只捕獲 refiner 節點的輸出
+                if "refiner" in tags or name == "refiner":
+                    chunk = data.get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        yield build_content_event(chunk.content)
+            
+            # 捕獲 Refiner 完成
+            elif event_type == "on_chain_end" and (name == "refiner" or "refiner" in tags):
+                output = data.get("output", {})
+                if isinstance(output, dict):
+                    # 嘗試從 output 中提取最終答案
+                    if "final_answer" in output:
+                        final_answer = output["final_answer"]
+                    elif "messages" in output:
+                        # 從 messages 中提取最後一個 AI 訊息
+                        messages = output["messages"]
+                        if messages and len(messages) > 0:
+                            last_msg = messages[-1]
+                            if hasattr(last_msg, "content"):
+                                final_answer = last_msg.content
+            
+            # 捕獲錯誤
+            elif event_type == "on_chain_error":
+                error = data.get("error", {})
+                error_msg = str(error) if error else "未知錯誤"
+                yield build_error_event(f"執行錯誤: {error_msg}")
+        
+        # 發送完成事件
+        yield build_complete_event(final_answer)
+        
+    except Exception as e:
+        logger.error(f"Error in stream_chat_response: {str(e)}")
+        logger.exception(e)
+        yield build_error_event(f"串流錯誤: {str(e)}")
+        yield build_complete_event()
+
+
+@router.post("/chat/execute")
 async def execute_chat(request: ExecuteChatRequest):
-    """Execute a chat request using Agentic RAG and get AI response."""
+    """Execute a chat request using Agentic RAG and stream the response."""
     try:
         # Verify session exists
         # Ensure session_id has proper table prefix
@@ -747,6 +928,35 @@ async def execute_chat(request: ExecuteChatRequest):
             "model_override": model_override,
         }
 
+        # Prepare config for graph execution
+        config_dict = {
+            "recursion_limit": 100,
+            "configurable": {
+                "thread_id": request.session_id,
+                "model_id": model_override,
+            }
+        }
+        
+        # Return streaming response
+        return StreamingResponse(
+            stream_chat_response(
+                request=request,
+                session=session,
+                model_override=model_override,
+                graph_input=graph_input,
+                config_dict=config_dict,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/event-stream; charset=utf-8",
+            },
+        )
+        
+        # 以下代碼保留作為參考，但不會執行（因為已經返回 StreamingResponse）
+        # 如果需要降級到非串流模式，可以取消註釋以下代碼
+        """
         # Execute Agentic RAG chat graph
         chat_graph = get_graph()
         try:

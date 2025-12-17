@@ -57,6 +57,9 @@ interface ChatPanelProps {
   // Notebook context stats (for notebook chat)
   notebookContextStats?: NotebookContextStats
   notebookId?: string
+  // Thinking process props (for streaming)
+  thinkingSteps?: Array<{ step_type: string; timestamp: number; content: string; metadata?: Record<string, unknown> }>
+  isThinking?: boolean
 }
 
 export function ChatPanel({
@@ -76,7 +79,9 @@ export function ChatPanel({
   title = 'Chat with Source',
   contextType = 'source',
   notebookContextStats,
-  notebookId
+  notebookId,
+  thinkingSteps = [],
+  isThinking = false
 }: ChatPanelProps) {
   const [input, setInput] = useState('')
   const [sessionManagerOpen, setSessionManagerOpen] = useState(false)
@@ -399,63 +404,84 @@ export function ChatPanel({
                 <p className="text-xs mt-2">Ask questions to understand the content better</p>
               </div>
             ) : (
-              messages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`flex gap-3 ${
-                    message.type === 'human' ? 'justify-end' : 'justify-start'
-                  }`}
-                >
-                  {message.type === 'ai' && (
-                    <div className="flex-shrink-0">
-                      <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
-                        <Bot className="h-4 w-4" />
+              messages.map((message, index) => {
+                const isLastMessage = index === messages.length - 1
+                const isStreamingLastMessage = isLastMessage && isStreaming && message.type === 'ai'
+                const showLiveThinking = isStreamingLastMessage && thinkingSteps.length > 0
+
+                return (
+                  <div
+                    key={message.id}
+                    className={`flex gap-3 ${
+                      message.type === 'human' ? 'justify-end' : 'justify-start'
+                    }`}
+                  >
+                    {message.type === 'ai' && (
+                      <div className="flex-shrink-0">
+                        <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
+                          <Bot className="h-4 w-4" />
+                        </div>
                       </div>
-                    </div>
-                  )}
-                  <div className="flex flex-col gap-2 max-w-[80%]">
-                    {/* 決策過程顯示（在消息泡泡上方） */}
-                    {message.type === 'ai' && message.thinking_process && (
-                      <AgentDecisionDisplay thinkingProcess={message.thinking_process} />
                     )}
-                    <div
-                      className={`rounded-lg px-4 py-2 ${
-                        message.type === 'human'
-                          ? 'bg-primary text-primary-foreground'
-                          : 'bg-muted'
-                      }`}
-                    >
-                      {message.type === 'ai' ? (
-                        <AIMessageContent
-                          content={message.content}
-                          onReferenceClick={handleReferenceClick}
-                          titleMap={titleMap}
+                    <div className="flex flex-col gap-2 max-w-[80%]">
+                      {/* 決策過程顯示（在消息泡泡上方） */}
+                      {message.type === 'ai' && message.thinking_process && (
+                        <AgentDecisionDisplay thinkingProcess={message.thinking_process} />
+                      )}
+                      
+                      {/* 即時思考過程顯示（僅在串流中顯示） */}
+                      {showLiveThinking && (
+                        <ThinkingProcessDisplay 
+                          thinkingProcess={{
+                            steps: thinkingSteps,
+                            total_iterations: 0,
+                            total_tool_calls: thinkingSteps.filter(s => s.step_type === 'tool_call').length,
+                            search_count: thinkingSteps.filter(s => s.step_type === 'search').length,
+                            reasoning_trace: []
+                          }}
                         />
-                      ) : (
-                        <p className="text-sm break-words overflow-wrap-anywhere">{message.content}</p>
+                      )}
+                      
+                      <div
+                        className={`rounded-lg px-4 py-2 ${
+                          message.type === 'human'
+                            ? 'bg-primary text-primary-foreground'
+                            : 'bg-muted'
+                        }`}
+                      >
+                        {message.type === 'ai' ? (
+                          <AIMessageContent
+                            content={message.content}
+                            onReferenceClick={handleReferenceClick}
+                            titleMap={titleMap}
+                          />
+                        ) : (
+                          <p className="text-sm break-words overflow-wrap-anywhere">{message.content}</p>
+                        )}
+                      </div>
+                      {message.type === 'ai' && (
+                        <>
+                          {/* 最終思考過程（完成後顯示，不與即時思考重複） */}
+                          {message.thinking_process && !showLiveThinking && (
+                            <ThinkingProcessDisplay thinkingProcess={message.thinking_process} />
+                          )}
+                          <MessageActions
+                            content={message.content}
+                            notebookId={notebookId}
+                          />
+                        </>
                       )}
                     </div>
-                    {message.type === 'ai' && (
-                      <>
-                        {message.thinking_process && (
-                          <ThinkingProcessDisplay thinkingProcess={message.thinking_process} />
-                        )}
-                        <MessageActions
-                          content={message.content}
-                          notebookId={notebookId}
-                        />
-                      </>
+                    {message.type === 'human' && (
+                      <div className="flex-shrink-0">
+                        <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center">
+                          <User className="h-4 w-4 text-primary-foreground" />
+                        </div>
+                      </div>
                     )}
                   </div>
-                  {message.type === 'human' && (
-                    <div className="flex-shrink-0">
-                      <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center">
-                        <User className="h-4 w-4 text-primary-foreground" />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))
+                )
+              })
             )}
             {isStreaming && (
               <div className="flex gap-3 justify-start">

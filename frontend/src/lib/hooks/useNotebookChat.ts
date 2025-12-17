@@ -9,7 +9,9 @@ import {
   NotebookChatMessage,
   CreateNotebookChatSessionRequest,
   UpdateNotebookChatSessionRequest,
-  SourceListResponse
+  SourceListResponse,
+  ChatStreamEvent,
+  AgentThinkingStep
 } from '@/lib/types/api'
 import { ContextSelections } from '@/app/(dashboard)/notebooks/[id]/page'
 
@@ -26,6 +28,8 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
   const [isSending, setIsSending] = useState(false)
   const [tokenCount, setTokenCount] = useState<number>(0)
   const [charCount, setCharCount] = useState<number>(0)
+  const [thinkingSteps, setThinkingSteps] = useState<AgentThinkingStep[]>([])
+  const [isThinking, setIsThinking] = useState(false)
 
   // Fetch sessions for this notebook
   const {
@@ -151,7 +155,30 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
     return response.context
   }, [notebookId, sources, contextSelections])
 
-  // Send message (synchronous, no streaming)
+  // Helper function to convert stream event to thinking step
+  const convertToThinkingStep = useCallback((event: ChatStreamEvent): AgentThinkingStep | null => {
+    if (event.type !== 'thought' || !event.content) {
+      return null
+    }
+
+    let stepType: AgentThinkingStep['step_type'] = 'decision'
+    if (event.stage === 'executing') {
+      stepType = 'tool_call'
+    } else if (event.stage === 'planning') {
+      stepType = 'decision'
+    } else if (event.stage === 'synthesizing') {
+      stepType = 'synthesis'
+    }
+
+    return {
+      step_type: stepType,
+      timestamp: event.timestamp || Date.now() / 1000,
+      content: event.content,
+      metadata: event.metadata || {}
+    }
+  }, [])
+
+  // Send message (streaming)
   const sendMessage = useCallback(async (message: string, modelOverride?: string) => {
     let sessionId = currentSessionId
 
@@ -176,6 +203,10 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
       }
     }
 
+    // Reset thinking state
+    setThinkingSteps([])
+    setIsThinking(false)
+
     // Add user message optimistically
     const userMessage: NotebookChatMessage = {
       id: `temp-${Date.now()}`,
@@ -196,46 +227,104 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
         model_override: modelOverride ?? (currentSession?.model_override ?? undefined)
       })
 
-      // Update messages with API response
-      setMessages(response.messages)
+      if (!response) {
+        throw new Error('No response body received')
+      }
+
+      const reader = response.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let aiMessage: NotebookChatMessage | null = null
+      const startTime = Date.now() / 1000
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+
+        // Keep the last incomplete line in buffer
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const jsonStr = line.slice(6).trim()
+              if (!jsonStr || jsonStr === '[DONE]') continue
+
+              const data: ChatStreamEvent = JSON.parse(jsonStr)
+
+              if (data.type === 'thought') {
+                setIsThinking(true)
+                const step = convertToThinkingStep(data)
+                if (step) {
+                  // Adjust timestamp to be relative to start time
+                  step.timestamp = startTime + (Date.now() / 1000 - startTime)
+                  setThinkingSteps(prev => [...prev, step])
+                }
+              } else if (data.type === 'content') {
+                setIsThinking(false) // Stop showing thinking when content starts
+                // Create AI message on first content chunk
+                if (!aiMessage) {
+                  aiMessage = {
+                    id: `ai-${Date.now()}`,
+                    type: 'ai',
+                    content: data.content || '',
+                    timestamp: new Date().toISOString()
+                  }
+                  setMessages(prev => [...prev, aiMessage!])
+                } else {
+                  // Append content to existing message
+                  aiMessage.content += data.content || ''
+                  setMessages(prev =>
+                    prev.map(msg => msg.id === aiMessage!.id
+                      ? { ...msg, content: aiMessage!.content }
+                      : msg
+                    )
+                  )
+                }
+              } else if (data.type === 'error') {
+                throw new Error(data.message || 'Stream error occurred')
+              } else if (data.type === 'complete') {
+                // Stop thinking indicator
+                setIsThinking(false)
+                // Final thinking process will be loaded via refetchCurrentSession
+              }
+            } catch (e) {
+              console.error('Error parsing SSE data:', e, 'Line:', line)
+              // Don't throw - continue processing other lines
+            }
+          }
+        }
+      }
+
+      // Ensure streaming is stopped
+      setIsSending(false)
+      setIsThinking(false)
 
       // Refetch current session to get updated data
       await refetchCurrentSession()
     } catch (error) {
       console.error('Error sending message:', error)
       
-      // Extract detailed error message from API response
+      // Extract detailed error message
       let errorMessage = 'Failed to send message'
       let isModelConfigError = false
       
-      if (error && typeof error === 'object' && 'response' in error) {
-        const axiosError = error as { response?: { status?: number; data?: { detail?: string } } }
-        const status = axiosError.response?.status
-        const detail = axiosError.response?.data?.detail
-        
-        if (detail) {
-          errorMessage = detail
-          // Check if it's a model configuration error
-          if (status === 400 && (
-            detail.toLowerCase().includes('model') ||
-            detail.toLowerCase().includes('configuration') ||
-            detail.toLowerCase().includes('no longer exists')
-          )) {
-            isModelConfigError = true
-            errorMessage = detail.replace(
-              /Please configure.*?Models\./i,
-              'Please go to Settings > Models to configure your default models.'
-            )
-          }
-        } else if (status === 400) {
-          errorMessage = 'Invalid request. Please check your input and try again.'
-        } else if (status === 404) {
-          errorMessage = 'Session not found. Please refresh the page.'
-        } else if (status === 500) {
-          errorMessage = 'Server error. Please try again later.'
-        }
-      } else if (error instanceof Error) {
+      if (error instanceof Error) {
         errorMessage = error.message || errorMessage
+        
+        // Check if it's a model configuration error
+        if (errorMessage.toLowerCase().includes('model') ||
+            errorMessage.toLowerCase().includes('configuration') ||
+            errorMessage.toLowerCase().includes('no longer exists')) {
+          isModelConfigError = true
+          errorMessage = errorMessage.replace(
+            /Please configure.*?Models\./i,
+            'Please go to Settings > Models to configure your default models.'
+          )
+        }
       }
       
       // Show error toast with appropriate styling
@@ -249,6 +338,8 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
       
       // Remove optimistic message on error
       setMessages(prev => prev.filter(msg => !msg.id.startsWith('temp-')))
+      setThinkingSteps([])
+      setIsThinking(false)
     } finally {
       setIsSending(false)
     }
@@ -258,7 +349,8 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
     currentSession,
     buildContext,
     refetchCurrentSession,
-    queryClient
+    queryClient,
+    convertToThinkingStep
   ])
 
   // Switch session
@@ -309,6 +401,8 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
     loadingSessions,
     tokenCount,
     charCount,
+    thinkingSteps,
+    isThinking,
 
     // Actions
     createSession,

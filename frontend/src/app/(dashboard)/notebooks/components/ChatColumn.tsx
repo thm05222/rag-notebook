@@ -97,6 +97,8 @@ export function ChatColumn({ notebookId, contextSelections }: ChatColumnProps) {
       loadingSessions={chat.loadingSessions}
       notebookContextStats={contextStats}
       notebookId={notebookId}
+      thinkingSteps={chat.thinkingSteps}
+      isThinking={chat.isThinking}
     />
   )
 }
