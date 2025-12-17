@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start -p ${PORT:-8188}",
-    "lint": "next lint"
+    "lint": "next lint",
+    "check-deps": "npm ls react react-dom next",
+    "test-compatibility": "npm run build && echo 'Build successful. Please manually test @uiw/react-md-editor and Radix UI components.'"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.1.1",

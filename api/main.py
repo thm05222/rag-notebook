@@ -290,9 +290,34 @@ app.add_middleware(IdempotencyMiddleware)
 app.add_middleware(PasswordAuthMiddleware, excluded_paths=["/", "/health", "/docs", "/openapi.json", "/redoc", "/api/auth/status", "/api/config"])
 
 # Add CORS middleware last (so it processes first)
+# Configure CORS from environment variable
+import os
+
+# Get environment settings
+env_type = os.getenv("ENVIRONMENT", "development").lower()
+cors_origins_env = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+
+allow_origins = []
+
+# Logic:
+# 1. If explicitly set to "*" or in development and not set, allow all
+if cors_origins_env == "*" or (not cors_origins_env and env_type == "development"):
+    allow_origins = ["*"]
+    if env_type == "production":
+        logger.warning("SECURITY WARNING: CORS is accepting all origins ('*') in production!")
+# 2. If specific origins are set, parse them
+elif cors_origins_env:
+    allow_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    logger.info(f"CORS allowed origins set to: {allow_origins}")
+# 3. Production environment and not set, keep empty list (most secure)
+else:
+    logger.warning("CORS_ALLOWED_ORIGINS is not set in production. API may be inaccessible from browsers.")
+    # Keep empty list to force explicit configuration
+    allow_origins = []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
