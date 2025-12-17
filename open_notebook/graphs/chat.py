@@ -353,18 +353,41 @@ def detect_circular_reasoning(state: ChatAgenticState) -> bool:
     if len(decision_history) < 3:
         return False
 
-    # 檢查是否有重複的決策模式
-    # 例如：連續 3 次相同的決策，或者在 5 次中有 4 次相同
+    # 關鍵修復：檢查是否有重複的決策模式
+    # decision_history 現在記錄的是 "action:tool_name" 格式（例如 "use_tool:vector_search"）
+    # 這樣可以區分不同的工具調用，避免誤判為循環
     recent = decision_history[-5:] if len(decision_history) >= 5 else decision_history
 
     if len(recent) >= 3:
-        # 檢查最後 3 次是否相同
+        # 1. 檢查最後 3 次是否完全相同（包括工具名稱）
         if len(set(recent[-3:])) == 1:
             logger.warning(
                 f"Circular reasoning detected: last 3 decisions are identical: {recent[-3:]}"
             )
             return True
-        # 檢查在 5 次中有 4 次相同
+        
+        # 2. 關鍵修復：檢查是否連續 3 次都是 "use_tool" 但工具執行都失敗或沒有結果
+        # 這種情況下，即使工具不同，也應該視為循環（因為沒有取得有效結果）
+        recent_three = recent[-3:]
+        all_use_tool = all(entry.startswith("use_tool:") for entry in recent_three)
+        if all_use_tool:
+            # 檢查最近的搜索歷史，看是否這些工具調用都失敗或沒有結果
+            search_history = state.get("search_history", [])
+            recent_searches = search_history[-3:] if search_history else []
+            
+            # 如果最近 3 次工具調用都失敗或沒有結果，視為循環
+            if len(recent_searches) >= 3:
+                all_failed_or_empty = all(
+                    not s.get("success", False) or s.get("result_count", 0) == 0
+                    for s in recent_searches
+                )
+                if all_failed_or_empty:
+                    logger.warning(
+                        f"Circular reasoning detected: last 3 tool calls all failed or returned no results: {recent_three}"
+                    )
+                    return True
+        
+        # 3. 檢查在 5 次中有 4 次相同（更寬鬆的標準）
         if len(recent) >= 5:
             from collections import Counter
 
@@ -794,8 +817,17 @@ async def agent_decision(
 
         # 關鍵修復：如果 action 是 finish，將 reasoning 設置為 final_answer
         # 這樣即使圖直接路由到 END，也能返回答案給用戶
+        
+        # 關鍵修復：decision_history 記錄更詳細的信息，包含 tool_name（如果有的話）
+        # 這樣可以區分不同的工具調用，避免誤判為循環
+        decision_entry = decision.action
+        if decision.action == "use_tool" and decision.tool_name:
+            decision_entry = f"{decision.action}:{decision.tool_name}"
+        elif decision.action in ["synthesize", "evaluate", "finish"]:
+            decision_entry = decision.action
+        
         result = {
-            "decision_history": [decision.action],  # 只返回新元素，LangGraph 會自動累積
+            "decision_history": [decision_entry],  # 記錄 action:tool_name 格式，LangGraph 會自動累積
             "reasoning_trace": [
                 decision.reasoning
             ],  # 只返回新元素，LangGraph 會自動累積
