@@ -342,7 +342,13 @@ def check_limits(state: ChatAgenticState) -> str:
 
 
 def detect_circular_reasoning(state: ChatAgenticState) -> bool:
-    """Detect if we're stuck in circular reasoning."""
+    """Detect if we're stuck in circular reasoning.
+    
+    修復後的檢測標準：
+    - 排除對 "use_tool" 的單純動作重複檢查（連續使用不同工具是合法的）
+    - 改為檢查 search_history 來判斷是否真的是重複執行相同的查詢
+    - 對於非 use_tool 的動作（如 evaluate, synthesize），保留原有的檢查邏輯
+    """
     decision_history = state.get("decision_history", [])
     iteration_count = state.get("iteration_count", 0)
 
@@ -350,55 +356,85 @@ def detect_circular_reasoning(state: ChatAgenticState) -> bool:
     if iteration_count == 0:
         return False
 
-    # 至少需要 3 個決策才能檢測循環
-    if len(decision_history) < 3:
+    # 關鍵調整：至少需要 5 個決策才能檢測循環（從 3 增加到 5）
+    if len(decision_history) < 5:
         return False
 
     # 關鍵修復：檢查是否有重複的決策模式
     # decision_history 現在記錄的是 "action:tool_name" 格式（例如 "use_tool:vector_search"）
-    # 這樣可以區分不同的工具調用，避免誤判為循環
-    recent = decision_history[-5:] if len(decision_history) >= 5 else decision_history
+    recent = decision_history[-7:] if len(decision_history) >= 7 else decision_history  # 檢查最近 7 次
 
-    if len(recent) >= 3:
-        # 1. 檢查最後 3 次是否完全相同（包括工具名稱）
-        if len(set(recent[-3:])) == 1:
-            logger.warning(
-                f"Circular reasoning detected: last 3 decisions are identical: {recent[-3:]}"
-            )
-            return True
-        
-        # 2. 關鍵修復：檢查是否連續 3 次都是 "use_tool" 但工具執行都失敗或沒有結果
-        # 這種情況下，即使工具不同，也應該視為循環（因為沒有取得有效結果）
-        recent_three = recent[-3:]
-        all_use_tool = all(entry.startswith("use_tool:") for entry in recent_three)
-        if all_use_tool:
-            # 檢查最近的搜索歷史，看是否這些工具調用都失敗或沒有結果
-            search_history = state.get("search_history", [])
-            recent_searches = search_history[-3:] if search_history else []
+    if len(recent) >= 5:
+        # 關鍵修復 1：檢查最後 5 次是否完全相同，但排除 use_tool
+        if len(set(recent[-5:])) == 1:
+            last_action = recent[-1]
             
-            # 如果最近 3 次工具調用都失敗或沒有結果，視為循環
-            if len(recent_searches) >= 3:
-                all_failed_or_empty = all(
-                    not s.get("success", False) or s.get("result_count", 0) == 0
-                    for s in recent_searches
-                )
-                if all_failed_or_empty:
-                    logger.warning(
-                        f"Circular reasoning detected: last 3 tool calls all failed or returned no results: {recent_three}"
+            # [關鍵修復]：use_tool 連續出現是合法的（例如連續搜索不同內容）
+            # 只有非 use_tool 的動作（如連續 evaluate 或 synthesize）才視為循環風險
+            if last_action.startswith("use_tool:"):
+                # 進階檢查：如果連續 5 次 use_tool，檢查是否查詢參數也完全一樣（真正的死循環）
+                # 這需要檢查 search_history 來判斷是否真的是重複執行相同的查詢
+                search_history = state.get("search_history", [])
+                recent_searches = search_history[-5:] if search_history else []
+                
+                if len(recent_searches) >= 5:
+                    # 檢查是否所有查詢都完全相同（真正的死循環）
+                    queries = [s.get("query", "") for s in recent_searches]
+                    if len(set(queries)) == 1 and queries[0]:  # 所有查詢都相同且非空
+                        logger.warning(
+                            f"Circular reasoning detected: last 5 tool calls with identical query '{queries[0]}': {recent[-5:]}"
+                        )
+                        return True
+                    
+                    # 檢查是否所有工具調用都失敗或沒有結果（無效循環）
+                    all_failed_or_empty = all(
+                        not s.get("success", False) or s.get("result_count", 0) == 0
+                        for s in recent_searches
                     )
-                    return True
+                    if all_failed_or_empty:
+                        logger.warning(
+                            f"Circular reasoning detected: last 5 tool calls all failed or returned no results: {recent[-5:]}"
+                        )
+                        return True
+                
+                # 如果 use_tool 的查詢不同，則不是循環（合法的多工具調用）
+                return False
+            else:
+                # 非 use_tool 的動作（如 evaluate, synthesize）連續出現，視為循環
+                logger.warning(
+                    f"Circular reasoning detected: last 5 decisions are identical: {recent[-5:]}"
+                )
+                return True
         
-        # 3. 檢查在 5 次中有 4 次相同（更寬鬆的標準）
-        if len(recent) >= 5:
+        # 關鍵修復 2：檢查在 7 次中有 6 次相同，但排除 use_tool
+        if len(recent) >= 7:
             from collections import Counter
 
             counter = Counter(recent)
             most_common = counter.most_common(1)
-            if most_common and most_common[0][1] >= 4:
-                logger.warning(
-                    f"Circular reasoning detected: {most_common[0][0]} appears {most_common[0][1]} times in last 5 decisions"
-                )
-                return True
+            if most_common and most_common[0][1] >= 6:  # 從 4 增加到 6
+                # 如果最常見的是 use_tool，需要進一步檢查查詢是否相同
+                if most_common[0][0].startswith("use_tool:"):
+                    search_history = state.get("search_history", [])
+                    recent_searches = search_history[-7:] if search_history else []
+                    
+                    if len(recent_searches) >= 7:
+                        # 檢查是否所有查詢都完全相同（真正的死循環）
+                        queries = [s.get("query", "") for s in recent_searches]
+                        if len(set(queries)) == 1 and queries[0]:  # 所有查詢都相同且非空
+                            logger.warning(
+                                f"Circular reasoning detected: {most_common[0][0]} appears {most_common[0][1]} times with identical query '{queries[0]}' in last 7 decisions"
+                            )
+                            return True
+                    
+                    # 如果查詢不同，則不是循環（合法的多工具調用）
+                    return False
+                else:
+                    # 非 use_tool 的動作重複出現，視為循環
+                    logger.warning(
+                        f"Circular reasoning detected: {most_common[0][0]} appears {most_common[0][1]} times in last 7 decisions"
+                    )
+                    return True
 
     return False
 
@@ -427,38 +463,42 @@ async def agent_decision(
     iteration = state.get("iteration_count", 0)
     logger.info(f"[Iteration {iteration}] Agent making decision...")
 
-    # 關鍵修復：檢測循環決策
-    # 只有在 iteration_count >= 3 時才檢查循環（至少需要 3 次決策才能形成循環）
+    # 關鍵修復：檢測循環決策（僅針對非 use_tool 的動作）
+    # 只有在 iteration_count >= 5 時才檢查循環（至少需要 5 次決策才能形成循環）
     decision_history = state.get("decision_history", [])
-    if iteration >= 3 and len(decision_history) >= 3:
-        # 檢查最近 3 次是否都是 evaluate
-        recent_decisions = decision_history[-3:]
-        if len(set(recent_decisions)) == 1 and recent_decisions[0] == "evaluate":
-            logger.warning(
-                f"[Iteration {iteration}] Detected circular evaluate decisions, forcing tool execution or synthesis"
-            )
-            # 如果有 collected_results，強制 synthesize
-            if state.get("collected_results"):
-                return {
-                    "current_decision": {"action": "synthesize"},
-                    "reasoning_trace": [
-                        "Circular evaluate detected, forcing synthesis"
-                    ],
-                    "iteration_count": state["iteration_count"] + 1,
-                }
-            # 否則強制執行工具
-            else:
-                return {
-                    "current_decision": {
-                        "action": "use_tool",
-                        "tool_name": "vector_search",
-                        "parameters": {"query": state["question"], "limit": 10},
-                    },
-                    "reasoning_trace": [
-                        "Circular evaluate detected, forcing tool execution"
-                    ],
-                    "iteration_count": state["iteration_count"] + 1,
-                }
+    if iteration >= 5 and len(decision_history) >= 5:
+        # 檢查最近 5 次是否都是 evaluate（非 use_tool 的動作才需要檢查）
+        recent_decisions = decision_history[-5:]
+        # 過濾掉 use_tool 動作，只檢查非工具動作的重複
+        non_tool_decisions = [d for d in recent_decisions if not d.startswith("use_tool:")]
+        
+        if len(non_tool_decisions) >= 5 and len(set(non_tool_decisions)) == 1:
+            if non_tool_decisions[0] == "evaluate":
+                logger.warning(
+                    f"[Iteration {iteration}] Detected circular evaluate decisions, forcing tool execution or synthesis"
+                )
+                # 如果有 collected_results，強制 synthesize
+                if state.get("collected_results"):
+                    return {
+                        "current_decision": {"action": "synthesize"},
+                        "reasoning_trace": [
+                            "Circular evaluate detected, forcing synthesis"
+                        ],
+                        "iteration_count": state["iteration_count"] + 1,
+                    }
+                # 否則強制執行工具
+                else:
+                    return {
+                        "current_decision": {
+                            "action": "use_tool",
+                            "tool_name": "vector_search",
+                            "parameters": {"query": state["question"], "limit": 10},
+                        },
+                        "reasoning_trace": [
+                            "Circular evaluate detected, forcing tool execution"
+                        ],
+                        "iteration_count": state["iteration_count"] + 1,
+                    }
 
     # Check limits first
     limit_check = check_limits(state)
@@ -1941,7 +1981,21 @@ async def synthesize_answer(
             f"[Iteration {iteration}] synthesize_answer: Prompt length: {len(system_content)} chars"
         )
 
-        response = await model.ainvoke(messages_payload)
+        # 關鍵修復：添加超時和更詳細的錯誤處理
+        try:
+            import asyncio
+            response = await asyncio.wait_for(
+                model.ainvoke(messages_payload),
+                timeout=120.0  # 2 分鐘超時
+            )
+            logger.info(f"[Iteration {iteration}] synthesize_answer: LLM invoke completed successfully")
+        except asyncio.TimeoutError:
+            logger.error(f"[Iteration {iteration}] synthesize_answer: LLM invoke timed out after 120 seconds")
+            raise TimeoutError("LLM response timeout after 120 seconds")
+        except Exception as invoke_error:
+            logger.error(f"[Iteration {iteration}] synthesize_answer: LLM invoke failed: {invoke_error}")
+            logger.exception(invoke_error)
+            raise
         content = (
             response.content
             if isinstance(response.content, str)
@@ -2111,7 +2165,7 @@ async def synthesize_answer(
             f"[Iteration {iteration}] synthesize_answer: Evaluation completed - decision={decision}, combined_score={combined_score:.2f}"
         )
 
-        # 關鍵修復：如果評估結果為 reject 但接近迭代限制，也強制設置 final_answer
+        # 關鍵調整：如果評估結果為 reject 但接近迭代限制，也強制設置 final_answer
         if decision == "reject" and is_near_limit:
             logger.warning(
                 f"[Iteration {iteration}] synthesize_answer: Evaluation rejected but near iteration limit, forcing final_answer"
@@ -2125,6 +2179,28 @@ async def synthesize_answer(
                 "reasoning_trace": [
                     f"Generated answer rejected by evaluation but forced acceptance due to iteration limit",
                     f"Quality score: {combined_score:.2f}, hallucination risk: {risk_score:.2f}",
+                ],
+            }
+        
+        # 關鍵調整：如果 combined_score >= 0.25 且 hallucination_risk 不是極高，也接受答案
+        # 避免過於嚴格導致重複嘗試
+        if decision == "reject" and combined_score >= 0.25 and risk_score <= 0.7:
+            logger.warning(
+                f"[Iteration {iteration}] synthesize_answer: Evaluation rejected but score >= 0.25 and risk <= 0.7, accepting answer"
+            )
+            # 關鍵修復：將最終答案添加到 messages 狀態中
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=answer)
+            return {
+                "messages": [ai_message],
+                "partial_answer": answer,
+                "final_answer": answer,  # 關鍵調整：即使被 reject，如果分數 >= 0.25 也接受
+                "hallucination_check": hallucination_check,
+                "evaluation_result": eval_result,
+                "iteration_count": state["iteration_count"] + 1,
+                "reasoning_trace": [
+                    f"Generated answer with quality score: {combined_score:.2f}, "
+                    f"hallucination risk: {risk_score:.2f} (accepted despite rejection due to reasonable score)"
                 ],
             }
         
@@ -2327,10 +2403,17 @@ def should_accept_answer(state: ChatAgenticState) -> str:
             )
             return "reject"  # 高風險，拒絕
 
-    # 標準接受條件
-    if combined_score >= 0.7:
+    # 關鍵調整：降低標準接受條件的閾值（從 0.7 降低到 0.5）
+    # 允許更多中等質量的答案被接受，減少不必要的拒絕
+    if combined_score >= 0.5:  # 從 0.7 降低到 0.5
         logger.info(
-            f"[Iteration {iteration}] should_accept_answer: Combined score ({combined_score:.2f}) >= 0.7, accepting"
+            f"[Iteration {iteration}] should_accept_answer: Combined score ({combined_score:.2f}) >= 0.5, accepting"
+        )
+        return "accept"
+    # 關鍵調整：如果分數 >= 0.25 且已經執行多次搜尋，也接受（從 0.3 降低到 0.25）
+    elif combined_score >= 0.25 and len(search_history) >= 2:
+        logger.info(
+            f"[Iteration {iteration}] should_accept_answer: Combined score ({combined_score:.2f}) >= 0.25 with multiple searches, accepting"
         )
         return "accept"
     elif iteration >= max_iterations - 1:

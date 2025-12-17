@@ -414,20 +414,25 @@ class EvaluationService:
     ) -> str:
         """
         根據評估分數和 Hallucination 風險確定下一步行動。
+        
+        調整後的閾值（更寬鬆）：
+        - 降低 synthesize 的閾值，允許更多答案被接受
+        - 提高 reject 的閾值，減少不必要的拒絕
         """
-        # 如果存在高 Hallucination 風險，拒絕答案
-        if has_hallucination_risk and hallucination_risk_score > 0.6:
+        # 關鍵調整：提高 reject 的閾值（從 0.6 提高到 0.8）
+        # 只有極高風險時才拒絕，避免過於嚴格
+        if has_hallucination_risk and hallucination_risk_score > 0.8:
             return "reject"
         
-        # 標準決策邏輯
-        if combined_score >= 0.75:
-            return "synthesize"
-        elif combined_score >= 0.5:
+        # 關鍵調整：降低 synthesize 的閾值（從 0.75/0.5 降低到 0.5/0.3）
+        # 允許更多中等質量的答案被接受
+        if combined_score >= 0.5:
             # 如果有中等 Hallucination 風險，優化搜尋而不是直接生成
-            if has_hallucination_risk and hallucination_risk_score > 0.3:
+            if has_hallucination_risk and hallucination_risk_score > 0.5:
                 return "refine_search"
             return "synthesize"
-        elif combined_score >= 0.3:
+        elif combined_score >= 0.25:  # 關鍵調整：從 0.3 降低到 0.25
+            # 即使分數較低，也嘗試優化搜尋而不是直接繼續
             return "refine_search"
         else:
             return "continue"
@@ -501,8 +506,10 @@ class EvaluationService:
         citation_ratio = len(valid_citations) / max(total_claims, 1)
         hallucination_risk = 1.0 - min(citation_ratio, 1.0)
         
+        # 關鍵調整：提高 has_hallucination_risk 的閾值（從 0.3 提高到 0.5）
+        # 只有中等以上風險才標記為有風險，避免過於嚴格
         return {
-            "has_hallucination_risk": hallucination_risk > 0.3,
+            "has_hallucination_risk": hallucination_risk > 0.5,  # 從 0.3 提高到 0.5
             "hallucination_risk_score": hallucination_risk,
             "valid_citations": list(valid_citations),
             "invalid_citations": list(invalid_citations),

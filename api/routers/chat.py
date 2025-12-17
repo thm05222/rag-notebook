@@ -186,6 +186,107 @@ async def create_session(request: CreateSessionRequest):
 
 
 @router.get(
+    "/chat/sessions/{session_id}/diagnostics"
+)
+async def get_session_diagnostics(session_id: str):
+    """Get diagnostic information about a chat session, including tool failures and errors."""
+    try:
+        # Ensure session_id has proper table prefix
+        full_session_id = (
+            session_id
+            if session_id.startswith("chat_session:")
+            else f"chat_session:{session_id}"
+        )
+        session = await ChatSession.get(full_session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Get session state from LangGraph
+        chat_graph = get_graph()
+        thread_state = await chat_graph.aget_state(
+            config=RunnableConfig(configurable={"thread_id": session_id})
+        )
+        
+        if not thread_state or not hasattr(thread_state, 'values'):
+            return {
+                "session_id": session_id,
+                "error": "No state found for this session",
+                "tool_failures": [],
+                "unavailable_tools": [],
+                "error_history": [],
+            }
+        
+        state_values = thread_state.values
+        
+        # Extract error history
+        error_history = state_values.get("error_history", [])
+        unavailable_tools = state_values.get("unavailable_tools", [])
+        
+        # Analyze tool failures
+        tool_failures = []
+        tool_failure_counts = {}
+        
+        for error in error_history:
+            if error.get("step") == "execute_tool":
+                tool_name = error.get("tool", "unknown")
+                iteration = error.get("iteration", 0)
+                error_msg = error.get("error", "Unknown error")
+                error_details = error.get("error_details", {})
+                
+                tool_failures.append({
+                    "tool": tool_name,
+                    "iteration": iteration,
+                    "error": error_msg,
+                    "error_details": error_details,
+                    "timestamp": error.get("timestamp"),
+                })
+                
+                # Count failures per tool
+                if tool_name not in tool_failure_counts:
+                    tool_failure_counts[tool_name] = {
+                        "count": 0,
+                        "errors": []
+                    }
+                tool_failure_counts[tool_name]["count"] += 1
+                tool_failure_counts[tool_name]["errors"].append({
+                    "iteration": iteration,
+                    "error": error_msg,
+                    "error_details": error_details,
+                })
+        
+        # Extract search history for context
+        search_history = state_values.get("search_history", [])
+        failed_searches = [
+            search for search in search_history 
+            if not search.get("success", True)
+        ]
+        
+        # Extract decision history
+        decision_history = state_values.get("decision_history", [])
+        
+        return {
+            "session_id": session_id,
+            "tool_failures": tool_failures,
+            "tool_failure_summary": tool_failure_counts,
+            "unavailable_tools": unavailable_tools,
+            "error_history": error_history,
+            "failed_searches": failed_searches,
+            "total_iterations": state_values.get("iteration_count", 0),
+            "total_errors": len(error_history),
+            "total_tool_failures": len(tool_failures),
+            "decision_history": decision_history[-10:],  # Last 10 decisions
+        }
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except Exception as e:
+        logger.error(f"Error fetching session diagnostics: {str(e)}")
+        logger.exception(e)
+        raise HTTPException(
+            status_code=500, detail=f"Error fetching session diagnostics: {str(e)}"
+        )
+
+
+@router.get(
     "/chat/sessions/{session_id}", response_model=ChatSessionWithMessagesResponse
 )
 async def get_session(session_id: str):
@@ -861,18 +962,29 @@ async def stream_chat_response(
             # 捕獲答案生成（token 流）
             elif event_type == "on_chat_model_stream":
                 # 只捕獲 refiner 節點的輸出
-                if "refiner" in tags or name == "refiner":
+                # 關鍵修復：檢查 name 和 tags，以及父節點名稱
+                is_refiner = (
+                    "refiner" in tags 
+                    or name == "refiner" 
+                    or name == "synthesize_answer"
+                    or (isinstance(name, str) and "refiner" in name.lower())
+                )
+                if is_refiner:
                     chunk = data.get("chunk")
                     if chunk and hasattr(chunk, "content") and chunk.content:
+                        logger.debug(f"stream_chat_response: Streaming content chunk from refiner (length: {len(chunk.content)} chars)")
                         yield build_content_event(chunk.content)
             
             # 捕獲 Refiner 完成
-            elif event_type == "on_chain_end" and (name == "refiner" or "refiner" in tags):
+            elif event_type == "on_chain_end" and (name == "refiner" or "refiner" in tags or name == "synthesize_answer"):
+                logger.info(f"stream_chat_response: Captured refiner on_chain_end event, name={name}, tags={tags}")
                 output = data.get("output", {})
+                logger.info(f"stream_chat_response: Refiner output type={type(output)}, keys={output.keys() if isinstance(output, dict) else 'not dict'}")
                 if isinstance(output, dict):
                     # 嘗試從 output 中提取最終答案
                     if "final_answer" in output:
                         final_answer = output["final_answer"]
+                        logger.info(f"stream_chat_response: Found final_answer in output (length: {len(final_answer) if final_answer else 0} chars)")
                     elif "messages" in output:
                         # 從 messages 中提取最後一個 AI 訊息
                         messages = output["messages"]
@@ -880,6 +992,20 @@ async def stream_chat_response(
                             last_msg = messages[-1]
                             if hasattr(last_msg, "content"):
                                 final_answer = last_msg.content
+                                logger.info(f"stream_chat_response: Found final_answer in messages (length: {len(final_answer) if final_answer else 0} chars)")
+                    # 關鍵修復：檢查 output 中是否有 partial_answer
+                    if not final_answer and "partial_answer" in output:
+                        partial_answer = output["partial_answer"]
+                        if partial_answer and len(partial_answer.strip()) > 0:
+                            logger.info(f"stream_chat_response: Found partial_answer in output, using as final_answer (length: {len(partial_answer)} chars)")
+                            yield build_content_event(partial_answer)
+                            final_answer = partial_answer
+                # 關鍵修復：如果 output 不是 dict，嘗試直接提取
+                elif output:
+                    logger.warning(f"stream_chat_response: Refiner output is not dict, type={type(output)}, trying to extract content")
+                    if hasattr(output, "content"):
+                        final_answer = output.content
+                        logger.info(f"stream_chat_response: Extracted final_answer from output.content (length: {len(final_answer) if final_answer else 0} chars)")
             
             # 捕獲錯誤
             elif event_type == "on_chain_error":

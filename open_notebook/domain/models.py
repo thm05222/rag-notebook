@@ -1,4 +1,4 @@
-from typing import ClassVar, Dict, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Union
 from pydantic import Field
 
 # Apply langchain patch before importing esperanto
