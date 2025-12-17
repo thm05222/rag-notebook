@@ -20,14 +20,14 @@ from types import SimpleNamespace as config
 CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
 
 # Initialize OCR engine at module level (avoid repeated initialization)
+# Use Tesseract OCR (same as content_core) for consistency
 try:
-    from rapidocr_onnxruntime import RapidOCR
-    _ocr_engine = RapidOCR()
+    import pytesseract
+    from PIL import Image
     _has_ocr = True
 except ImportError:
-    _ocr_engine = None
     _has_ocr = False
-    logging.warning("RapidOCR not found. OCR capability disabled. Install with: pip install rapidocr-onnxruntime")
+    logging.warning("pytesseract not found. OCR capability disabled. Install with: pip install pytesseract Pillow")
 
 def count_tokens(text, model=None):
     if not text:
@@ -461,20 +461,23 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
                         pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
                         img_bytes = pix.tobytes("png")
                         
-                        # Execute OCR
-                        ocr_result, _ = _ocr_engine(img_bytes)
+                        # Execute OCR using Tesseract (same as content_core)
+                        # Convert bytes to PIL Image
+                        img = Image.open(BytesIO(img_bytes))
                         
-                        if ocr_result:
-                            # Extract text from OCR results
-                            # RapidOCR returns format: [[box, text, score], ...]
-                            ocr_text = "\n".join([res[1] for res in ocr_result if len(res) > 1])
-                            
-                            # Strategy: Use OCR result if it's better than original extraction
-                            if len(ocr_text.strip()) > len(cleaned_text):
-                                page_text = ocr_text
-                                logging.info(f"OCR successful for page {i+1}: Found {len(ocr_text)} chars")
-                            else:
-                                logging.debug(f"OCR result not better than original for page {i+1}, keeping original")
+                        # Configure Tesseract for multiple languages (matching cc_config.yaml)
+                        # Languages: English, Simplified Chinese, Traditional Chinese
+                        ocr_config = '--oem 3 --psm 6 -l eng+chi_sim+chi_tra'
+                        
+                        # Extract text using Tesseract
+                        ocr_text = pytesseract.image_to_string(img, config=ocr_config)
+                        
+                        # Strategy: Use OCR result if it's better than original extraction
+                        if ocr_text and len(ocr_text.strip()) > len(cleaned_text):
+                            page_text = ocr_text.strip()
+                            logging.info(f"OCR successful for page {i+1}: Found {len(ocr_text)} chars")
+                        else:
+                            logging.debug(f"OCR result not better than original for page {i+1}, keeping original")
                 except Exception as e:
                     logging.warning(f"OCR failed for page {i+1}: {e}")
                     # On error, keep original text (don't break the process)

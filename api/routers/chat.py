@@ -1058,9 +1058,10 @@ async def execute_chat(request: ExecuteChatRequest):
                                 logger.error("Timeout recovery: Fallback answer is empty, using collected_results")
                                 # 如果 fallback 也失敗，從 collected_results 構建基本答案
                                 if collected_results:
-                                    answer_to_use = f"""抱歉，執行時間過長，已自動停止。
+                                    result_count = len(collected_results)
+                                    answer_to_use = """抱歉，執行時間過長，已自動停止。
 
-我已經收集了 {len(collected_results)} 個相關結果，但無法在時間限制內完成完整的答案生成。
+我已經收集了 """ + str(result_count) + """ 個相關結果，但無法在時間限制內完成完整的答案生成。
 
 請嘗試：
 - 簡化您的問題
@@ -1074,9 +1075,10 @@ async def execute_chat(request: ExecuteChatRequest):
                             logger.exception(fallback_error)
                             # 最後的 fallback：從 collected_results 構建基本答案
                             if collected_results:
-                                answer_to_use = f"""抱歉，執行時間過長，已自動停止。
+                                result_count = len(collected_results)
+                                answer_to_use = """抱歉，執行時間過長，已自動停止。
 
-我已經收集了 {len(collected_results)} 個相關結果，但無法完成答案生成。
+我已經收集了 """ + str(result_count) + """ 個相關結果，但無法完成答案生成。
 
 請嘗試重新發送請求。
 """
