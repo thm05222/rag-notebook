@@ -273,6 +273,7 @@ class VectorSearchParameters(BaseModel):
     minimum_score: float = Field(default=0.2, ge=0.0, le=1.0, description="Minimum similarity score (0-1)")
     search_sources: bool = Field(default=True, description="Search in sources")
     notebook_ids: Optional[List[str]] = Field(default=None, description="Optional list of notebook IDs to filter by")
+    source_ids: Optional[List[str]] = Field(default=None, description="Optional list of source IDs to filter by. Use this to search within specific documents only.")
 
 
 class TextSearchParameters(BaseModel):
@@ -280,6 +281,7 @@ class TextSearchParameters(BaseModel):
     query: str = Field(..., description="Search query")
     limit: int = Field(default=10, ge=1, description="Maximum number of results")
     search_sources: bool = Field(default=True, description="Search in sources")
+    source_ids: Optional[List[str]] = Field(default=None, description="Optional list of source IDs to filter by. Use this to search within specific documents only.")
 
 
 class CalculationParameters(BaseModel):
@@ -315,6 +317,7 @@ class VectorSearchTool(BaseTool):
         minimum_score = kwargs.get("minimum_score", 0.2)
         search_sources = kwargs.get("search_sources", True)
         notebook_ids = kwargs.get("notebook_ids")
+        source_ids = kwargs.get("source_ids")
 
         try:
             results = await vector_search(
@@ -323,6 +326,7 @@ class VectorSearchTool(BaseTool):
                 source=search_sources,
                 minimum_score=minimum_score,
                 notebook_ids=notebook_ids,
+                source_ids=source_ids,
             )
 
             return {
@@ -378,12 +382,14 @@ class TextSearchTool(BaseTool):
         query = kwargs.get("query", "")
         limit = kwargs.get("limit", 10)
         search_sources = kwargs.get("search_sources", True)
+        source_ids = kwargs.get("source_ids")
 
         try:
             results = await text_search(
                 keyword=query,
                 results=limit,
                 source=search_sources,
+                source_ids=source_ids,
             )
 
             return {

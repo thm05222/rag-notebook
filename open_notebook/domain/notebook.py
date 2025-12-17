@@ -773,11 +773,15 @@ class ChatSession(ObjectModel):
 
 
 async def text_search(
-    keyword: str, results: int, source: bool = True
+    keyword: str, 
+    results: int, 
+    source: bool = True,
+    source_ids: Optional[List[str]] = None,
 ):
     if not keyword:
         raise InvalidInputError("Search keyword cannot be empty")
     try:
+        # 構建查詢，如果提供了 source_ids，在應用層進行過濾
         search_results = await repo_query(
             """
             select *
@@ -785,6 +789,50 @@ async def text_search(
             """,
             {"keyword": keyword, "results": results, "source": source},
         )
+        
+        # 如果提供了 source_ids，在應用層過濾結果
+        # fn::text_search 返回的結果包含 item_id 欄位，這是 source 的 ID
+        if source_ids and search_results:
+            filtered_results = []
+            # 標準化 source_ids 列表（支援完整格式 "source:xxx" 和簡短格式 "xxx"）
+            normalized_source_ids = set()
+            for sid in source_ids:
+                if sid.startswith("source:"):
+                    normalized_source_ids.add(sid)
+                    normalized_source_ids.add(sid.replace("source:", ""))  # 同時添加簡短格式
+                else:
+                    normalized_source_ids.add(sid)
+                    normalized_source_ids.add(f"source:{sid}")  # 同時添加完整格式
+            
+            for result in search_results:
+                # 檢查結果中的 item_id 欄位（fn::text_search 返回的欄位名）
+                result_item_id = None
+                if isinstance(result, dict):
+                    result_item_id = result.get("item_id") or result.get("id")
+                
+                # 檢查是否匹配
+                if result_item_id:
+                    # 標準化 result_item_id
+                    if isinstance(result_item_id, str):
+                        if result_item_id.startswith("source:"):
+                            result_normalized = result_item_id
+                        else:
+                            result_normalized = f"source:{result_item_id}"
+                        
+                        if result_item_id in normalized_source_ids or result_normalized in normalized_source_ids:
+                            filtered_results.append(result)
+                else:
+                    # 如果無法確定 item_id，且沒有 source_ids 過濾，保留結果（向後兼容）
+                    if not source_ids:
+                        logger.debug(f"text_search: Result has no item_id field, keeping for backward compatibility: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}")
+                        filtered_results.append(result)
+                    else:
+                        # 有 source_ids 過濾但無法確定 item_id，跳過此結果
+                        logger.debug(f"text_search: Result has no item_id field, skipping due to source_ids filter: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}")
+            
+            search_results = filtered_results
+            logger.info(f"text_search: Filtered results to {len(filtered_results)} using source_ids filter")
+        
         return search_results
     except Exception as e:
         logger.error(f"Error performing text search: {str(e)}")
@@ -798,6 +846,7 @@ async def vector_search(
     source: bool = True,
     minimum_score=0.2,
     notebook_ids: Optional[List[str]] = None,
+    source_ids: Optional[List[str]] = None,
 ):
     """
     Perform vector search using Qdrant
@@ -808,6 +857,7 @@ async def vector_search(
         source: Whether to search source embeddings and insights
         minimum_score: Minimum similarity score
         notebook_ids: Optional list of notebook IDs to filter by
+        source_ids: Optional list of source IDs to filter by
         
     Returns:
         List of search results with similarity scores
@@ -817,7 +867,7 @@ async def vector_search(
     try:
         import time
         vector_search_start = time.time()
-        logger.info(f"vector_search: Starting search for keyword='{keyword[:50]}...', results={results}, source={source}, minimum_score={minimum_score}, notebook_ids={notebook_ids}")
+        logger.info(f"vector_search: Starting search for keyword='{keyword[:50]}...', results={results}, source={source}, minimum_score={minimum_score}, notebook_ids={notebook_ids}, source_ids={source_ids}")
         
         EMBEDDING_MODEL = await model_manager.get_embedding_model()
         if EMBEDDING_MODEL is None:
@@ -845,6 +895,7 @@ async def vector_search(
                 query_vector=query_vector,
                 limit=results,
                 notebook_ids=notebook_ids,
+                source_ids=source_ids,
                 search_sources=source,
                 min_score=minimum_score
             )

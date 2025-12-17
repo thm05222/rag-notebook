@@ -574,6 +574,7 @@ class QdrantService:
         query_vector: List[float],
         limit: int = 10,
         notebook_ids: Optional[List[str]] = None,
+        source_ids: Optional[List[str]] = None,
         search_sources: bool = True,
         min_score: float = 0.2
     ) -> List[Dict[str, Any]]:
@@ -584,6 +585,7 @@ class QdrantService:
             query_vector: Query vector
             limit: Maximum number of results
             notebook_ids: Optional list of notebook IDs to filter by
+            source_ids: Optional list of source IDs to filter by
             search_sources: Whether to search source embeddings and insights
             min_score: Minimum similarity score
             
@@ -598,6 +600,7 @@ class QdrantService:
         logger.info(f"QdrantService.vector_search: Parameters - limit={limit}, search_sources={search_sources}, min_score={min_score}")
         logger.info(f"QdrantService.vector_search: Query vector dimension: {len(query_vector) if query_vector else 'None'}")
         logger.info(f"QdrantService.vector_search: Notebook IDs filter: {notebook_ids if notebook_ids else 'None (no filter)'}")
+        logger.info(f"QdrantService.vector_search: Source IDs filter: {source_ids if source_ids else 'None (no filter)'}")
         
         await self._ensure_collections()
         client = await self._ensure_client()
@@ -609,20 +612,31 @@ class QdrantService:
         
         all_results = []
         
-        # Build filter for notebook_ids if provided
+        # Build filter for notebook_ids and source_ids if provided
         query_filter = None
+        filter_conditions = []
+        
         if notebook_ids:
-            query_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="notebook_ids",
-                        match=MatchAny(any=notebook_ids)
-                    )
-                ]
+            filter_conditions.append(
+                FieldCondition(
+                    key="notebook_ids",
+                    match=MatchAny(any=notebook_ids)
+                )
             )
-            logger.info(f"QdrantService.vector_search: Applied notebook filter with {len(notebook_ids)} notebook IDs")
+        
+        if source_ids:
+            filter_conditions.append(
+                FieldCondition(
+                    key="source_id",
+                    match=MatchAny(any=source_ids)
+                )
+            )
+        
+        if filter_conditions:
+            query_filter = Filter(must=filter_conditions)
+            logger.info(f"QdrantService.vector_search: Applied filters - notebook_ids: {len(notebook_ids) if notebook_ids else 0}, source_ids: {len(source_ids) if source_ids else 0}")
         else:
-            logger.info(f"QdrantService.vector_search: No notebook filter applied")
+            logger.info(f"QdrantService.vector_search: No filters applied")
         
         # Search source embeddings
         if search_sources:

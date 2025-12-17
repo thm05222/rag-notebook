@@ -95,19 +95,38 @@ Based on the question, current state, and available tools, decide what to do nex
    - **Best for:** Financial reports, legal documents, academic papers, technical manuals.
    - **Parameters:**
      - `query`: The search query
-     - `source_ids`: (Optional) List of specific source IDs to search. Use this when you know which documents are relevant based on the Knowledge Base Overview above.
-     - `notebook_id`: (Optional) Search all sources in a notebook
+     - `source_ids`: (REQUIRED) List of specific source IDs to search. You MUST provide this parameter based on the Knowledge Base Overview above.
+     - `notebook_id`: (Optional) Search all sources in a notebook (less efficient)
      - `limit`: Maximum number of results (default: 10)
    - **Strategy:** 
-     - If the Knowledge Base Overview shows relevant documents, use `source_ids` to limit search scope.
+     - ALWAYS use `source_ids` when you know which documents are relevant from the Knowledge Base Overview.
      - Use when the answer requires "reading the whole section" or comparing chapters.
      - It preserves document structure (page numbers, hierarchy).
 
 2. **Vector Search (`vector_search`)**:
-   - Use for general concept lookup or finding specific snippets across MANY documents.
-   - Best when you need semantic similarity matching.
+   - **Role:** Semantic similarity search across documents.
+   - **Best for:** General concept lookup or finding specific snippets across multiple documents.
+   - **Parameters:**
+     - `query`: The search query
+     - `limit`: Maximum number of results (default: 10)
+     - `source_ids`: (Optional) List of specific source IDs to search. Use this to limit search to specific documents when you know which ones are relevant.
+     - `notebook_ids`: (Optional) List of notebook IDs to filter by
+   - **Strategy:**
+     - If the user's question references a specific document (e.g., "What does the Google report say?"), use `source_ids` to search only that document.
+     - If the question is general across all documents, you may omit `source_ids`.
+     - Use `source_ids` to eliminate ambiguity when multiple similar documents exist.
 
-3. **Internet Search (`internet_search`)**:
+3. **Text Search (`text_search`)**:
+   - **Role:** Keyword-based full-text search using BM25 ranking.
+   - **Best for:** Finding specific keywords, phrases, or exact matches.
+   - **Parameters:**
+     - `query`: The search query
+     - `limit`: Maximum number of results (default: 10)
+     - `source_ids`: (Optional) List of specific source IDs to search. Use this to limit search to specific documents.
+   - **Strategy:**
+     - Similar to Vector Search, use `source_ids` when you know which documents contain the keywords.
+
+4. **Internet Search (`internet_search`)**:
    - **Role:** Access real-time web information and external knowledge verification.
    - **Parameters:**
      - `query`: The search keywords.
