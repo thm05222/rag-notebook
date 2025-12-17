@@ -77,6 +77,27 @@ Based on the question, conversation history (if any), current state, and availab
 - Vector search (`vector_search`) is best for semantic similarity queries
 - Text search (`text_search`) is best for keyword-based queries
 
+**Tool Usage Guidelines:**
+
+3. **Internet Search (`internet_search`)**:
+   - **Role:** Access real-time web information and external knowledge verification.
+   - **Parameters:**
+     - `query`: The search keywords.
+     - `limit`: Maximum number of results (default: 5).
+     - `categories`: A list of categories to filter results (Select carefully based on intent):
+       - `['general']`: Default. Best for general knowledge, trivia, or broad topics.
+       - `['news']`: Use for current events, stock prices, or recent developments.
+       - `['it']`: Use for programming questions, software documentation, GitHub repos, or StackOverflow.
+       - `['science']`: Use for academic papers (Arxiv), scientific concepts, or research data.
+       - `['files']`: Use when specifically looking for PDF reports or documents.
+       - `['images']`: Use when searching for images.
+       - You can combine multiple categories: `['science', 'general']` for comprehensive research.
+   - **Strategy:** 
+     - If the user asks about a Python error, use `['it']`.
+     - If the user asks about a recent earthquake, use `['news']`.
+     - If the user asks about "Transformer architecture", use `['science', 'general']`.
+     - If the user asks about general knowledge or definitions, use `['general']`.
+
 Return a JSON object:
 
 ```json

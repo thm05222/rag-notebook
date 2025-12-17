@@ -4,10 +4,12 @@ Provides unified interface for all tools (vector search, text search, PageIndex,
 """
 
 import asyncio
+import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Literal, Optional, Type
 
+import httpx
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
@@ -287,10 +289,17 @@ class CalculationParameters(BaseModel):
     expression: str = Field(..., description="Mathematical expression to evaluate (e.g., '2+2', '100 * 3.14', 'convert 100 USD to EUR')")
 
 
+# 定義合法的搜尋類別
+ValidCategory = Literal["general", "news", "science", "it", "files", "images"]
+
 class InternetSearchParameters(BaseModel):
     """Parameters for internet search tool."""
     query: str = Field(..., description="Search query")
-    limit: int = Field(default=10, ge=1, description="Maximum number of results")
+    limit: int = Field(default=5, ge=1, description="Maximum number of results")
+    categories: List[ValidCategory] = Field(
+        default=["general"], 
+        description="Search categories: general (default), news, science, it, files, images"
+    )
 
 
 # Built-in tools
@@ -421,7 +430,7 @@ class TextSearchTool(BaseTool):
 
 
 class InternetSearchTool(BaseTool):
-    """Internet search tool using DuckDuckGo."""
+    """Internet search tool using SearXNG."""
 
     def __init__(self):
         super().__init__(
@@ -433,67 +442,152 @@ class InternetSearchTool(BaseTool):
         )
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
-        """Execute internet search using DuckDuckGo."""
-        try:
-            from duckduckgo_search import DDGS
-        except ImportError:
-            raise ToolExecutionError(
-                "duckduckgo-search library is not installed. "
-                "Please install it with: pip install duckduckgo-search"
-            )
-
+        """
+        使用本地託管的 SearXNG 進行隱私搜尋。
+        
+        Args:
+            query: 搜尋關鍵字。
+            limit: 返回結果數量。
+            categories: 搜尋範疇 (general, news, science, it...)。
+        """
+        # 在 Docker 網路中，host 名稱就是 service 名稱
+        # 支援多個 URL 回退：環境變數 > Docker 服務名 > localhost（用於調試）
+        searxng_url = os.getenv("SEARXNG_URL")
+        if not searxng_url:
+            # 預設使用 Docker 服務名稱
+            searxng_url = "http://searxng:8080"
+        
         query = kwargs.get("query", "")
-        limit = kwargs.get("limit", 10)
+        limit = kwargs.get("limit", 5)
+        categories = kwargs.get("categories", ["general"])
+        
+        # 處理參數
+        category_str = ",".join(categories) if categories else "general"
+        # 從環境變數讀取 SafeSearch 強制設定 (0=None, 1=Moderate, 2=Strict)
+        safe_search_level = os.getenv("SEARCH_SAFESEARCH_LEVEL", "1")
 
+        params = {
+            "q": query,
+            "format": "json",       # 強制 JSON
+            "categories": category_str,
+            "safesearch": safe_search_level,
+            "language": "auto",     # 或指定 "zh-TW"
+            "engines": "google,bing,duckduckgo,arxiv" # 可選：指定特定引擎
+        }
+
+        # 嘗試多個 URL（用於診斷和回退）
+        urls_to_try = [searxng_url]
+        # 如果預設是 Docker 服務名，也嘗試 localhost（可能從主機調用）
+        if searxng_url == "http://searxng:8080":
+            urls_to_try.append("http://localhost:8080")
+
+        last_error = None
+        for url in urls_to_try:
+            try:
+                logger.debug(f"嘗試連接到 SearXNG: {url}")
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(
+                        f"{url}/search", 
+                        params=params
+                    )
+                    if response.status_code != 200:
+                        error_text = response.text
+                        error_msg = f"SearXNG Error ({response.status_code}): {error_text}"
+                        logger.error(f"{self.name} failed at {url}: {error_msg}")
+                        last_error = error_msg
+                        continue  # 嘗試下一個 URL
+                    
+                    data = response.json()
+                    results = data.get("results", [])
+
+                    # 格式化結果給 LLM
+                    formatted_results = []
+                    for r in results[:limit]:
+                        formatted_results.append({
+                            "id": f"internet_search:{hash(r.get('url', ''))}",
+                            "title": r.get("title", ""),
+                            "url": r.get("url", ""),
+                            "content": r.get("content", "") or r.get("snippet", ""),
+                            "source": r.get("engine", "searxng"),
+                            "category": r.get("category", category_str),
+                            "published_date": r.get("publishedDate"), # 如果有的話
+                            "similarity": 1.0,  # Internet search doesn't have similarity scores
+                        })
+                    
+                    if not formatted_results:
+                        return {
+                            "tool_name": self.name,
+                            "success": True,
+                            "data": [{"content": "No results found."}],
+                            "error": None,
+                            "execution_time": 0.0,
+                            "metadata": {
+                                "result_count": 0,
+                                "query": query,
+                                "search_type": "internet",
+                                "searxng_url": url,
+                            },
+                        }
+
+                    logger.info(f"SearXNG 搜尋成功，使用 URL: {url}")
+                    return {
+                        "tool_name": self.name,
+                        "success": True,
+                        "data": formatted_results,
+                        "error": None,
+                        "execution_time": 0.0,
+                        "metadata": {
+                            "result_count": len(formatted_results),
+                            "query": query,
+                            "search_type": "internet",
+                            "categories": category_str,
+                            "searxng_url": url,
+                        },
+                    }
+            except httpx.RequestError as e:
+                # 連接失敗，嘗試下一個 URL
+                last_error = f"無法連接到 {url}: {str(e)}"
+                logger.warning(f"{self.name} 連接失敗 {url}: {str(e)}")
+                continue
+            except Exception as e:
+                # 其他錯誤，記錄並嘗試下一個 URL
+                last_error = f"{url} 錯誤: {str(e)}"
+                logger.warning(f"{self.name} 在 {url} 發生錯誤: {str(e)}")
+                continue
+
+        # 所有 URL 都失敗了
+        error_msg = f"所有 SearXNG URL 都無法連接。最後錯誤: {last_error}"
+        logger.error(f"{self.name} failed: {error_msg}")
+        return {
+            "tool_name": self.name,
+            "success": False,
+            "data": [],
+            "error": error_msg,
+            "execution_time": 0.0,
+            "metadata": {
+                "error_type": "ConnectionError",
+                "error_message": error_msg,
+                "query": query,
+                "tried_urls": urls_to_try,
+            },
+            "error_details": {
+                "reason": "無法連接到 SearXNG 服務",
+                "suggestion": (
+                    "請確認：\n"
+                    "1. SearXNG 容器是否正常運行：docker ps | grep searxng\n"
+                    "2. 容器是否在同一個網路中：docker network inspect rag-notebook_rag_network\n"
+                    "3. 檢查 SearXNG 日誌：docker logs searxng\n"
+                    "4. 嘗試手動訪問：curl http://localhost:8080/search?q=test&format=json\n"
+                    "5. 如果從容器內調用，確保設置 SEARXNG_URL=http://searxng:8080"
+                ),
+            }
+        }
+
+        # 以下代碼不會執行，但保留以備不時之需
         try:
-            # Execute search with region set to 'wt-wt' for worldwide English results
-            with DDGS(region='wt-wt') as ddgs:
-                results = list(ddgs.text(query, max_results=limit))
-
-            # Format results to match other search tools
-            formatted_results = []
-            for result in results:
-                formatted_results.append({
-                    "id": f"internet_search:{hash(result.get('href', ''))}",
-                    "title": result.get("title", ""),
-                    "content": result.get("body", ""),
-                    "url": result.get("href", ""),
-                    "source": "internet_search",
-                    "similarity": 1.0,  # Internet search doesn't have similarity scores
-                })
-
-            return {
-                "tool_name": self.name,
-                "success": True,
-                "data": formatted_results,
-                "error": None,
-                "execution_time": 0.0,
-                "metadata": {
-                    "result_count": len(formatted_results),
-                    "query": query,
-                    "search_type": "internet",
-                },
-            }
-        except ImportError:
-            # 不 raise，而是返回錯誤結果
-            error_msg = "duckduckgo-search library is not installed. Please install it with: pip install duckduckgo-search"
-            logger.error(f"{self.name} failed: {error_msg}")
-            return {
-                "tool_name": self.name,
-                "success": False,
-                "data": [],
-                "error": error_msg,
-                "execution_time": 0.0,
-                "metadata": {
-                    "error_type": "ImportError",
-                    "error_message": error_msg,
-                    "query": query,
-                },
-                "error_details": {
-                    "reason": "缺少必要的依賴庫",
-                    "suggestion": "請安裝 duckduckgo-search 庫：pip install duckduckgo-search",
-                }
-            }
+            pass
+            # 這個 except 塊已經被上面的邏輯處理了
+            pass
         except Exception as e:
             # 不 raise，而是返回錯誤結果
             error_msg = str(e)

@@ -1,4 +1,4 @@
-﻿services:
+services:
     surrealdb:
         image: surrealdb/surrealdb:v2
         ports:
@@ -11,6 +11,8 @@
         pull_policy: never
         user: root
         restart: always
+        networks:
+            - rag_network
     qdrant:
         image: qdrant/qdrant:latest
         ports:
@@ -23,6 +25,8 @@
             - QDRANT__SERVICE__GRPC_PORT=6334
         pull_policy: never
         restart: always
+        networks:
+            - rag_network
         healthcheck:
             # Check if port 6333 is listening using /proc/net/tcp
             # Port 6333 in hex (big-endian) is 18BD, and 0A means LISTEN state
@@ -36,6 +40,31 @@
             timeout: 10s
             retries: 3
             start_period: 40s
+    searxng:
+        image: searxng/searxng:latest
+        container_name: searxng
+        restart: unless-stopped
+        ports:
+            - "8080:8080" # 映射到本機方便調試，生產環境可移除
+        volumes:
+            - ./config/searxng:/etc/searxng:rw # 掛載設定檔
+        environment:
+            - SEARXNG_BASE_URL=http://localhost:8080/
+            # 為了安全，這裡關閉 limiter，因為只有您的 Agent 會呼叫它
+            - SEARXNG_LIMITER=false
+        networks:
+            - rag_network # 確保與 api 服務在同一個網路
+        cap_drop:
+            - ALL
+        cap_add:
+            - CHOWN
+            - SETGID
+            - SETUID
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "1m"
+                max-file: "1"
     open_notebook:
         build:
             context: .
@@ -51,6 +80,7 @@
         depends_on:
             - surrealdb
             - qdrant
+            - searxng
         volumes:
             - ./notebook_data:/app/data
             - ./open_notebook:/app/open_notebook
@@ -59,6 +89,8 @@
             - ./commands:/app/commands
             - ./cc_config.yaml:/app/cc_config.yaml
         restart: always
+        networks:
+            - rag_network
         # Docker logging driver for log rotation (since stdout/stderr cannot be rotated by supervisord)
         logging:
             driver: "json-file"
@@ -80,3 +112,7 @@
             nofile:
                 soft: 65536
                 hard: 65536
+
+networks:
+    rag_network:
+        driver: bridge

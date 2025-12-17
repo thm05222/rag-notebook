@@ -1,0 +1,35 @@
+# 使用預設設定並覆蓋特定部分
+use_default_settings: true
+
+# 伺服器設定
+server:
+  secret_key: "generateme" # 請執行 openssl rand -hex 32 替換此值
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false # 關閉速率限制 (因為是內部呼叫)
+  image_proxy: true # 啟用圖片代理 (保護隱私)
+
+# 搜尋設定：允許 JSON 格式輸出，這是 API 溝通的基礎
+search:
+  safe_search: 1 # 預設開啟 (1=Moderate), 可由環境變數覆蓋
+  autocomplete: ""
+  formats:
+    - html
+    - json # <--- 必須啟用
+
+# 搜尋引擎配置 (您可以根據需求開關)
+engines:
+  - name: google
+    disabled: false
+  
+  - name: bing
+    disabled: false
+
+  - name: duckduckgo
+    disabled: false
+
+  - name: arxiv
+    disabled: false
+
+  - name: github
+    disabled: false
