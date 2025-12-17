@@ -165,15 +165,17 @@ export function SourceTypeStep({ control, register, errors }: SourceTypeStepProp
                           ? `Files * (${selectedFiles.length} selected)`
                           : 'File(s) *'}
                       </Label>
-                      <Input
-                        id="file"
-                        type="file"
-                        multiple
-                        accept=".pdf,.doc,.docx,.txt,.md,.epub"
-                        {...register('file', {
-                          onChange: handleFileChange
-                        })}
-                      />
+                      <div className="w-full overflow-x-auto">
+                        <Input
+                          id="file"
+                          type="file"
+                          multiple
+                          accept=".pdf,.doc,.docx,.txt,.md,.epub"
+                          {...register('file', {
+                            onChange: handleFileChange
+                          })}
+                        />
+                      </div>
                       <p className="text-xs text-muted-foreground mt-1">
                         Supported formats: PDF, DOC, DOCX, TXT, MD, EPUB. You can select multiple files.
                       </p>
