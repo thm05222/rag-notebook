@@ -89,6 +89,9 @@ class ExecuteChatRequest(BaseModel):
     model_override: Optional[str] = Field(
         None, description="Optional model override for this message"
     )
+    notebook_id: Optional[str] = Field(
+        None, description="Optional notebook ID for auto-creating session if not found"
+    )
 
 
 class ExecuteChatResponse(BaseModel):
@@ -722,13 +725,15 @@ def build_error_event(message: str) -> str:
     return f"data: {json.dumps(event_data)}\n\n"
 
 
-def build_complete_event(final_answer: Optional[str] = None) -> str:
+def build_complete_event(final_answer: Optional[str] = None, session_id: Optional[str] = None) -> str:
     """構建完成事件（SSE 格式）"""
     event_data = {
         "type": "complete",
     }
     if final_answer:
         event_data["final_answer"] = final_answer
+    if session_id:
+        event_data["session_id"] = session_id
     return f"data: {json.dumps(event_data)}\n\n"
 
 
@@ -738,6 +743,7 @@ async def stream_chat_response(
     model_override: Optional[str],
     graph_input: Dict[str, Any],
     config_dict: Dict[str, Any],
+    actual_session_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """串流聊天響應生成器"""
     chat_graph = get_graph()
@@ -857,8 +863,46 @@ async def stream_chat_response(
                 error_msg = str(error) if error else "未知錯誤"
                 yield build_error_event(f"執行錯誤: {error_msg}")
         
-        # 發送完成事件
-        yield build_complete_event(final_answer)
+        # 關鍵修復：在發送完成事件之前，檢查最終狀態，確保即使 final_answer 是 None，也使用 partial_answer
+        if not final_answer:
+            try:
+                # 獲取最終狀態
+                final_state = await chat_graph.aget_state(
+                    config=config_dict
+                )
+                if final_state and hasattr(final_state, 'values'):
+                    state_values = final_state.values
+                    # 檢查 partial_answer
+                    partial_answer = state_values.get("partial_answer")
+                    if partial_answer and len(partial_answer.strip()) > 0:
+                        # 關鍵修復：將 partial_answer 通過 SSE 發送給用戶（如果還沒有發送過）
+                        # 因為可能沒有觸發 on_chat_model_stream 事件（LLM 返回空內容）
+                        logger.info(f"stream_chat_response: Found partial_answer, sending via SSE (length: {len(partial_answer)} chars)")
+                        # 將完整的 partial_answer 作為內容事件發送
+                        yield build_content_event(partial_answer)
+                        final_answer = partial_answer
+                        logger.info(f"stream_chat_response: Using partial_answer as final_answer (length: {len(final_answer)} chars)")
+                    # 如果還是沒有，檢查 messages 中的最後一個 AI 消息
+                    elif not final_answer:
+                        messages = state_values.get("messages", [])
+                        if messages:
+                            from langchain_core.messages import AIMessage
+                            # 從後往前查找 AI 消息
+                            for msg in reversed(messages):
+                                if (hasattr(msg, 'type') and msg.type == 'ai') or isinstance(msg, AIMessage):
+                                    if hasattr(msg, 'content') and msg.content:
+                                        content = msg.content
+                                        # 關鍵修復：如果找到了 AI 消息內容，也通過 SSE 發送
+                                        logger.info(f"stream_chat_response: Found AI message content, sending via SSE (length: {len(content)} chars)")
+                                        yield build_content_event(content)
+                                        final_answer = content
+                                        logger.info(f"stream_chat_response: Using last AI message content as final_answer (length: {len(final_answer)} chars)")
+                                        break
+            except Exception as state_error:
+                logger.warning(f"stream_chat_response: Failed to get final state: {state_error}")
+        
+        # 發送完成事件（包含實際的 session_id，如果會話被自動創建）
+        yield build_complete_event(final_answer, actual_session_id)
         
     except Exception as e:
         logger.error(f"Error in stream_chat_response: {str(e)}")
@@ -871,16 +915,53 @@ async def stream_chat_response(
 async def execute_chat(request: ExecuteChatRequest):
     """Execute a chat request using Agentic RAG and stream the response."""
     try:
-        # Verify session exists
+        # Verify session exists, auto-create if not found and notebook_id provided
         # Ensure session_id has proper table prefix
         full_session_id = (
             request.session_id
             if request.session_id.startswith("chat_session:")
             else f"chat_session:{request.session_id}"
         )
-        session = await ChatSession.get(full_session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
+        try:
+            session = await ChatSession.get(full_session_id)
+        except NotFoundError:
+            # Session not found - try to auto-create if notebook_id is provided
+            if request.notebook_id:
+                logger.info(f"Session {full_session_id} not found, auto-creating new session for notebook {request.notebook_id}")
+                try:
+                    # Verify notebook exists
+                    notebook = await Notebook.get(request.notebook_id)
+                    if not notebook:
+                        raise HTTPException(status_code=404, detail=f"Notebook {request.notebook_id} not found")
+                    
+                    # Create new session with default title
+                    import asyncio
+                    default_title = request.message[:50] + "..." if len(request.message) > 50 else request.message
+                    session = ChatSession(
+                        title=default_title or f"Chat Session {asyncio.get_event_loop().time():.0f}",
+                        model_override=request.model_override,
+                    )
+                    await session.save()
+                    
+                    # Relate session to notebook
+                    await session.relate_to_notebook(request.notebook_id)
+                    
+                    # Update full_session_id to use the new session ID
+                    full_session_id = session.id or full_session_id
+                    logger.info(f"Auto-created session {full_session_id} for notebook {request.notebook_id}")
+                except HTTPException:
+                    raise
+                except Exception as create_error:
+                    logger.error(f"Failed to auto-create session: {create_error}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Session not found and failed to auto-create: {str(create_error)}"
+                    )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Session {full_session_id} not found. Please create a new session or provide notebook_id to auto-create."
+                )
 
         # Determine model override (per-request override takes precedence over session-level)
         model_override = (
@@ -889,11 +970,15 @@ async def execute_chat(request: ExecuteChatRequest):
             else getattr(session, "model_override", None)
         )
 
+        # Extract thread_id from full_session_id (remove prefix if present)
+        # This ensures we use the correct session ID even if it was auto-created
+        thread_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
+        
         # Get current state (for conversation history)
         chat_graph = get_graph()
         current_state = await chat_graph.aget_state(
             config=RunnableConfig(
-                configurable={"thread_id": request.session_id}
+                configurable={"thread_id": thread_id}
             )
         )
 
@@ -901,12 +986,16 @@ async def execute_chat(request: ExecuteChatRequest):
         state_values = current_state.values if current_state else {}
         messages = state_values.get("messages", [])
         
-        # Get notebook from session
+        # Get notebook from session (or use provided notebook_id if session was auto-created)
+        notebook_id_from_session = None
         notebook_id_query = await repo_query(
             "SELECT out FROM refers_to WHERE in = $session_id",
             {"session_id": ensure_record_id(full_session_id)},
         )
-        notebook_id = notebook_id_query[0]["out"] if notebook_id_query else None
+        notebook_id_from_session = notebook_id_query[0]["out"] if notebook_id_query else None
+        
+        # Use notebook_id from request if session was auto-created, otherwise use from session relationship
+        notebook_id = request.notebook_id or notebook_id_from_session
         notebook = None
         if notebook_id:
             try:
@@ -929,15 +1018,18 @@ async def execute_chat(request: ExecuteChatRequest):
         }
 
         # Prepare config for graph execution
+        # Use thread_id (actual session ID without prefix)
         config_dict = {
             "recursion_limit": 100,
             "configurable": {
-                "thread_id": request.session_id,
+                "thread_id": thread_id,
                 "model_id": model_override,
             }
         }
         
         # Return streaming response
+        # Pass actual_session_id in case session was auto-created
+        actual_session_id_for_stream = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
         return StreamingResponse(
             stream_chat_response(
                 request=request,
@@ -945,6 +1037,7 @@ async def execute_chat(request: ExecuteChatRequest):
                 model_override=model_override,
                 graph_input=graph_input,
                 config_dict=config_dict,
+                actual_session_id=actual_session_id_for_stream,
             ),
             media_type="text/event-stream",
             headers={
@@ -953,6 +1046,12 @@ async def execute_chat(request: ExecuteChatRequest):
                 "Content-Type": "text/event-stream; charset=utf-8",
             },
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error executing chat: {str(e)}")
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail=f"Error executing chat: {str(e)}")
         
         # 以下代碼保留作為參考，但不會執行（因為已經返回 StreamingResponse）
         # 如果需要降級到非串流模式，可以取消註釋以下代碼
@@ -971,11 +1070,11 @@ async def execute_chat(request: ExecuteChatRequest):
             config_dict = {
                 "recursion_limit": 100,  # 在頂層設置（關鍵修復）
                 "configurable": {
-                    "thread_id": request.session_id,
+                    "thread_id": thread_id,
                     "model_id": model_override,
                 }
             }
-            logger.info(f"Config prepared: recursion_limit=100 (top-level), thread_id={request.session_id}")
+            logger.info(f"Config prepared: recursion_limit=100 (top-level), thread_id={thread_id}")
             
             # 嘗試使用字典形式的 config（LangGraph 可能接受）
             # 如果失敗，再嘗試 RunnableConfig
@@ -984,7 +1083,7 @@ async def execute_chat(request: ExecuteChatRequest):
             except Exception:
                 config = RunnableConfig(
                     configurable={
-                        "thread_id": request.session_id,
+                        "thread_id": thread_id,
                         "model_id": model_override,
                     }
                 )
@@ -1011,7 +1110,7 @@ async def execute_chat(request: ExecuteChatRequest):
                     logger.info("Attempting to recover state from checkpointer after timeout...")
                     current_state = await chat_graph.aget_state(
                         config=RunnableConfig(
-                            configurable={"thread_id": request.session_id}
+                            configurable={"thread_id": thread_id}
                         )
                     )
                     state_values = current_state.values if current_state and hasattr(current_state, 'values') else {}
@@ -1059,15 +1158,14 @@ async def execute_chat(request: ExecuteChatRequest):
                                 # 如果 fallback 也失敗，從 collected_results 構建基本答案
                                 if collected_results:
                                     result_count = len(collected_results)
-                                    answer_to_use = """抱歉，執行時間過長，已自動停止。
-
-我已經收集了 """ + str(result_count) + """ 個相關結果，但無法在時間限制內完成完整的答案生成。
-
-請嘗試：
-- 簡化您的問題
-- 重新發送請求
-- 檢查知識庫中是否有相關資料
-"""
+                                    answer_to_use = (
+                                        "抱歉，執行時間過長，已自動停止。\n\n"
+                                        "我已經收集了 " + str(result_count) + " 個相關結果，但無法在時間限制內完成完整的答案生成。\n\n"
+                                        "請嘗試：\n"
+                                        "- 簡化您的問題\n"
+                                        "- 重新發送請求\n"
+                                        "- 檢查知識庫中是否有相關資料"
+                                    )
                                 else:
                                     answer_to_use = "抱歉，執行時間過長，已自動停止。請嘗試重新表述問題或稍後再試。"
                         except Exception as fallback_error:
@@ -1076,12 +1174,11 @@ async def execute_chat(request: ExecuteChatRequest):
                             # 最後的 fallback：從 collected_results 構建基本答案
                             if collected_results:
                                 result_count = len(collected_results)
-                                answer_to_use = """抱歉，執行時間過長，已自動停止。
-
-我已經收集了 """ + str(result_count) + """ 個相關結果，但無法完成答案生成。
-
-請嘗試重新發送請求。
-"""
+                                answer_to_use = (
+                                    "抱歉，執行時間過長，已自動停止。\n\n"
+                                    "我已經收集了 " + str(result_count) + " 個相關結果，但無法完成答案生成。\n\n"
+                                    "請嘗試重新發送請求。"
+                                )
                             else:
                                 answer_to_use = "抱歉，執行時間過長，已自動停止。請嘗試重新表述問題或稍後再試。"
                     
@@ -1102,7 +1199,7 @@ async def execute_chat(request: ExecuteChatRequest):
                     # 關鍵修復：保存 messages 到 state（如果需要）
                     try:
                         await chat_graph.aupdate_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id}),
+                            config=RunnableConfig(configurable={"thread_id": thread_id}),
                             values={"messages": messages}  # 只更新 messages
                         )
                         logger.info(f"Timeout recovery: Saved messages to LangGraph state")
@@ -1130,13 +1227,13 @@ async def execute_chat(request: ExecuteChatRequest):
                             "error_history": [],
                         }
                         await chat_graph.aupdate_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id}),
+                            config=RunnableConfig(configurable={"thread_id": thread_id}),
                             values=clear_values
                         )
                         
                         # 驗證清空是否成功
                         current_state_after = await chat_graph.aget_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id})
+                            config=RunnableConfig(configurable={"thread_id": thread_id})
                         )
                         state_after = current_state_after.values if current_state_after else {}
                         
@@ -1203,7 +1300,9 @@ async def execute_chat(request: ExecuteChatRequest):
                     
                     await session.save()
                     logger.info(f"Timeout recovery: Returning ExecuteChatResponse with {len(response_messages)} messages")
-                    return ExecuteChatResponse(session_id=request.session_id, messages=response_messages)
+                    # Use actual session_id (may be different if session was auto-created)
+                    actual_session_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
+                    return ExecuteChatResponse(session_id=actual_session_id, messages=response_messages)
                 except Exception as fallback_error:
                     logger.error(f"Failed to generate timeout fallback: {fallback_error}")
                     logger.exception(fallback_error)
@@ -1223,7 +1322,7 @@ async def execute_chat(request: ExecuteChatRequest):
                     # 獲取當前狀態
                     current_state = await chat_graph.aget_state(
                         config=RunnableConfig(
-                            configurable={"thread_id": request.session_id}
+                            configurable={"thread_id": thread_id}
                         )
                     )
                     state_values = current_state.values if current_state and hasattr(current_state, 'values') else {}
@@ -1265,7 +1364,7 @@ async def execute_chat(request: ExecuteChatRequest):
                     # 只更新 messages，不更新其他字段，避免覆蓋累積字段
                     try:
                         await chat_graph.aupdate_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id}),
+                            config=RunnableConfig(configurable={"thread_id": thread_id}),
                             values={"messages": messages}  # 只更新 messages
                         )
                         logger.info(f"Recursion limit fallback: Saved fallback answer to LangGraph state")
@@ -1294,13 +1393,13 @@ async def execute_chat(request: ExecuteChatRequest):
                             "error_history": [],
                         }
                         await chat_graph.aupdate_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id}),
+                            config=RunnableConfig(configurable={"thread_id": thread_id}),
                             values=clear_values
                         )
                         
                         # 驗證清空是否成功
                         current_state_after = await chat_graph.aget_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id})
+                            config=RunnableConfig(configurable={"thread_id": thread_id})
                         )
                         state_after = current_state_after.values if current_state_after else {}
                         
@@ -1360,7 +1459,9 @@ async def execute_chat(request: ExecuteChatRequest):
                     # Update session timestamp
                     await session.save()
                     logger.info(f"Recursion limit fallback: Returning ExecuteChatResponse with {len(response_messages)} messages")
-                    return ExecuteChatResponse(session_id=request.session_id, messages=response_messages)
+                    # Use actual session_id (may be different if session was auto-created)
+                    actual_session_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
+                    return ExecuteChatResponse(session_id=actual_session_id, messages=response_messages)
                 except Exception as fallback_error:
                     logger.error(f"Failed to generate fallback answer: {fallback_error}")
                     logger.exception(fallback_error)
@@ -1407,7 +1508,7 @@ async def execute_chat(request: ExecuteChatRequest):
         try:
             # 先獲取當前狀態，記錄清空前的情況
             current_state_before = await chat_graph.aget_state(
-                config=RunnableConfig(configurable={"thread_id": request.session_id})
+                config=RunnableConfig(configurable={"thread_id": thread_id})
             )
             state_before = current_state_before.values if current_state_before else {}
             
@@ -1430,13 +1531,13 @@ async def execute_chat(request: ExecuteChatRequest):
                 "error_history": [],
             }
             await chat_graph.aupdate_state(
-                config=RunnableConfig(configurable={"thread_id": request.session_id}),
+                config=RunnableConfig(configurable={"thread_id": thread_id}),
                 values=clear_values
             )
             
             # 驗證清空是否成功
             current_state_after = await chat_graph.aget_state(
-                config=RunnableConfig(configurable={"thread_id": request.session_id})
+                config=RunnableConfig(configurable={"thread_id": thread_id})
             )
             state_after = current_state_after.values if current_state_after else {}
             
@@ -1563,7 +1664,9 @@ async def execute_chat(request: ExecuteChatRequest):
         
         logger.info(f"Returning ExecuteChatResponse with {len(response_messages)} messages")
 
-        return ExecuteChatResponse(session_id=request.session_id, messages=response_messages)
+        # Use actual session_id (may be different if session was auto-created)
+        actual_session_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
+        return ExecuteChatResponse(session_id=actual_session_id, messages=response_messages)
     except NotFoundError:
         raise HTTPException(status_code=404, detail="Session not found")
     except ValueError as e:
@@ -1682,13 +1785,13 @@ async def execute_chat(request: ExecuteChatRequest):
                             "error_history": [],
                         }
                         await chat_graph.aupdate_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id}),
+                            config=RunnableConfig(configurable={"thread_id": thread_id}),
                             values=clear_values
                         )
                         
                         # 驗證清空是否成功
                         current_state_after = await chat_graph.aget_state(
-                            config=RunnableConfig(configurable={"thread_id": request.session_id})
+                            config=RunnableConfig(configurable={"thread_id": thread_id})
                         )
                         state_after = current_state_after.values if current_state_after else {}
                         
@@ -1712,7 +1815,9 @@ async def execute_chat(request: ExecuteChatRequest):
                         logger.exception(clear_error)
                     
                     await session.save()
-                    return ExecuteChatResponse(session_id=request.session_id, messages=response_messages)
+                    # Use actual session_id (may be different if session was auto-created)
+                    actual_session_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
+                    return ExecuteChatResponse(session_id=actual_session_id, messages=response_messages)
                 else:
                     logger.warning("Connection error but no partial state found in checkpointer")
             except Exception as recovery_error:
@@ -1733,6 +1838,7 @@ async def execute_chat(request: ExecuteChatRequest):
         
         logger.error(f"Error executing chat: {error_msg}")
         raise HTTPException(status_code=500, detail=f"Error executing chat: {error_msg}")
+        """
 
 
 @router.post("/chat/context", response_model=BuildContextResponse)

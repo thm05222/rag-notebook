@@ -76,7 +76,6 @@ async def lifespan(app: FastAPI):
     # Initialize and register tools for Agentic RAG
     try:
         from open_notebook.services.tool_service import (
-            CalculationTool,
             InternetSearchTool,
             TextSearchTool,
             VectorSearchTool,
@@ -86,7 +85,6 @@ async def lifespan(app: FastAPI):
         logger.info("Registering built-in tools...")
         await tool_registry.register(VectorSearchTool())
         await tool_registry.register(TextSearchTool())
-        await tool_registry.register(CalculationTool())
         await tool_registry.register(InternetSearchTool())
         logger.success("Built-in tools registered successfully")
         

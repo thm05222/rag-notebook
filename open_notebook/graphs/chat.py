@@ -30,6 +30,7 @@ from typing_extensions import TypedDict
 
 from open_notebook.config import LANGGRAPH_CHECKPOINT_FILE
 from open_notebook.domain.notebook import Notebook
+from open_notebook.exceptions import ToolNotFoundError
 from open_notebook.graphs.utils import provision_langchain_model
 from open_notebook.services.evaluation_service import evaluation_service
 from open_notebook.services.tool_service import tool_registry
@@ -74,6 +75,7 @@ class ChatAgenticState(TypedDict):
         List[str], operator.add
     ]  # Decision history for cycle detection
     error_history: Annotated[List[Dict[str, Any]], operator.add]  # Error history
+    unavailable_tools: Annotated[List[str], operator.add]  # Tools that are unavailable (not found or failed)
     model_override: Optional[str]  # Model override for this session
     current_decision: Optional[Dict[str, Any]]  # 當前決策（關鍵修復：添加缺失的字段）
     refinement_feedback: Optional[Dict[str, Any]]  # Feedback from Refiner when rejecting answer
@@ -304,6 +306,36 @@ def check_limits(state: ChatAgenticState) -> str:
     # Check for circular reasoning
     if detect_circular_reasoning(state):
         return "circular_reasoning"
+    
+    # 新增：檢查連續工具錯誤
+    error_history = state.get("error_history", [])
+    if len(error_history) >= 5:
+        recent_tool_errors = [
+            e for e in error_history[-5:] 
+            if e.get("step") == "execute_tool"
+        ]
+        if len(recent_tool_errors) >= 5:
+            # 記錄失敗的工具名稱
+            failed_tools = [e.get("tool", "unknown") for e in recent_tool_errors]
+            tool_counts = {}
+            for tool in failed_tools:
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            
+            # 詳細記錄所有錯誤信息
+            logger.error(
+                f"[Iteration {state.get('iteration_count', 0)}] Too many tool errors detected. "
+                f"Total error_history length: {len(error_history)}, "
+                f"Recent tool errors: {len(recent_tool_errors)}. "
+                f"Failed tools: {tool_counts}"
+            )
+            # 記錄每個失敗工具的詳細信息
+            for error in recent_tool_errors:
+                logger.error(
+                    f"  - Tool: {error.get('tool', 'unknown')}, "
+                    f"Error: {error.get('error', 'N/A')[:200]}, "
+                    f"Iteration: {error.get('iteration', 'N/A')}"
+                )
+            return "too_many_tool_errors"
 
     return "continue"
 
@@ -411,12 +443,41 @@ async def agent_decision(
         logger.warning(
             f"State details: decision_history={len(state.get('decision_history', []))}, search_history={len(state.get('search_history', []))}, collected_results={len(state.get('collected_results', []))}"
         )
-        # 如果有限制，返回 final_answer 讓圖終止
-        final_answer = (
-            state.get("partial_answer")
-            or state.get("final_answer")
-            or f"Unable to complete due to: {limit_check}"
-        )
+        
+        # 如果有限制，記錄詳細的錯誤信息
+        if limit_check == "too_many_tool_errors":
+            error_history = state.get("error_history", [])
+            recent_tool_errors = [
+                e for e in error_history[-5:] 
+                if e.get("step") == "execute_tool"
+            ]
+            failed_tools = [e.get("tool", "unknown") for e in recent_tool_errors]
+            tool_counts = {}
+            for tool in failed_tools:
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            
+            # 構建詳細的錯誤訊息
+            error_details = []
+            for tool, count in tool_counts.items():
+                error_details.append(f"{tool} ({count}次)")
+            error_summary = "、".join(error_details)
+            
+            logger.error(
+                f"[Iteration {iteration}] Tool execution failures detected: {error_summary}. "
+                f"Recent errors: {recent_tool_errors[-3:]}"
+            )
+            
+            final_answer = (
+                state.get("partial_answer")
+                or state.get("final_answer")
+                or f"無法完成查詢：工具執行連續失敗多次。失敗的工具：{error_summary}。請檢查工具配置或嘗試重新表述問題。"
+            )
+        else:
+            final_answer = (
+                state.get("partial_answer")
+                or state.get("final_answer")
+                or f"Unable to complete due to: {limit_check}"
+            )
         return {
             "reasoning_trace": [f"Stopped due to: {limit_check}"],
             "final_answer": final_answer,
@@ -477,6 +538,15 @@ async def agent_decision(
     # Get available tools
     available_tools = await tool_registry.list_tools()
 
+    # 過濾不可用的工具
+    unavailable_tools = state.get("unavailable_tools", [])
+    if unavailable_tools:
+        logger.warning(f"[Iteration {iteration}] Filtering unavailable tools: {unavailable_tools}")
+        available_tools = [
+            tool for tool in available_tools 
+            if tool.get("name") not in unavailable_tools
+        ]
+
     # 關鍵修復：記錄所有可用工具，特別標記 MCP 工具和 PageIndex
     tool_names = [tool.get("name", "unknown") for tool in available_tools]
     mcp_tools = [
@@ -530,6 +600,15 @@ async def agent_decision(
     # 包含錯誤歷史，讓 Agent 知道哪些工具失敗了（關鍵修復）
     error_history = state.get("error_history", [])
     recent_errors = error_history[-5:] if error_history else []  # 最近 5 個錯誤
+
+    # 檢查是否有強制停止標記
+    for error in recent_errors:
+        if error.get("error_details", {}).get("force_stop"):
+            logger.error(f"[Iteration {iteration}] Force stop detected due to tool errors")
+            return {
+                "final_answer": error.get("error_details", {}).get("suggestion", "無法完成查詢"),
+                "reasoning_trace": [f"強制停止：{error.get('error', '未知錯誤')}"],
+            }
 
     # 獲取 refinement_feedback（如果存在）
     refinement_feedback = state.get("refinement_feedback")
@@ -762,6 +841,7 @@ def route_decision(state: ChatAgenticState) -> str:
     """Route based on agent decision."""
     current_decision = state.get("current_decision")
     iteration = state.get("iteration_count", 0)
+    final_answer = state.get("final_answer")
 
     # 關鍵調試：記錄完整的狀態信息
     logger.info(
@@ -769,16 +849,23 @@ def route_decision(state: ChatAgenticState) -> str:
     )
     logger.info(f"[Iteration {iteration}] State keys: {list(state.keys())}")
 
+    # 如果已經有 final_answer，直接路由到 finish
+    if final_answer:
+        logger.info(
+            f"[Iteration {iteration}] final_answer exists, routing to finish"
+        )
+        return "finish"
+
     if not current_decision:
         logger.warning(
-            f"[Iteration {iteration}] No current_decision found, routing to evaluate"
+            f"[Iteration {iteration}] No current_decision found, routing to synthesize"
         )
         logger.warning(
             f"[Iteration {iteration}] decision_history length: {len(state.get('decision_history', []))}"
         )
-        return "evaluate"
+        return "synthesize"
 
-    action = current_decision.get("action", "evaluate")
+    action = current_decision.get("action", "synthesize")
     tool_name = current_decision.get("tool_name", "no tool")
     logger.info(f"[Iteration {iteration}] Routing to: {action} (tool: {tool_name})")
     return action
@@ -1017,6 +1104,108 @@ async def execute_tool(
         else:
             # 沒有選定的 sources：傳 None，搜尋所有
             parameters["notebook_ids"] = None
+    
+    # 關鍵修復：為 pageindex_search 處理 context_config
+    elif tool_name == "pageindex_search":
+        if selected_source_ids:
+            # PageIndex 工具接受 source_ids 參數（複數）
+            parameters["source_ids"] = selected_source_ids
+            logger.info(
+                f"[Iteration {iteration}] PageIndex search: Using source_ids from context_config ({len(selected_source_ids)} sources)"
+            )
+        else:
+            # 如果沒有選定的 sources，嘗試從 state 中獲取 notebook_id
+            # 優先使用 state 中的 notebook，因為這是最可靠的來源
+            notebook = state.get("notebook")
+            if notebook:
+                if isinstance(notebook, dict) and notebook.get("id"):
+                    parameters["notebook_id"] = notebook.get("id")
+                    logger.info(
+                        f"[Iteration {iteration}] PageIndex search: Using notebook_id from state (dict): {notebook.get('id')}"
+                    )
+                elif hasattr(notebook, 'id'):
+                    parameters["notebook_id"] = notebook.id
+                    logger.info(
+                        f"[Iteration {iteration}] PageIndex search: Using notebook_id from state (object): {notebook.id}"
+                    )
+            else:
+                # 如果 state 中沒有 notebook，記錄警告
+                logger.warning(
+                    f"[Iteration {iteration}] PageIndex search: No notebook in state and no source_ids selected. "
+                    f"This may cause parameter validation to fail."
+                )
+
+    # 關鍵修復：清理參數，將字符串 'None' 轉換為 None
+    # 這可能發生在 LLM 生成決策時將 None 序列化為字符串
+    cleaned_parameters = {}
+    for key, value in parameters.items():
+        if isinstance(value, str) and value.lower() == 'none':
+            # 跳過 None 值（不添加到參數中）
+            continue
+        elif isinstance(value, str) and value == 'None':
+            # 跳過字符串 'None'
+            continue
+        else:
+            cleaned_parameters[key] = value
+    
+    # 對於 pageindex_search，特別處理 notebook_ids 和 notebook_id 參數
+    if tool_name == "pageindex_search":
+        # 移除無效的 notebook_ids 參數（如果是字符串 'None'）
+        if "notebook_ids" in cleaned_parameters:
+            notebook_ids_value = cleaned_parameters.get("notebook_ids")
+            if notebook_ids_value == 'None' or notebook_ids_value == 'none':
+                del cleaned_parameters["notebook_ids"]
+            elif notebook_ids_value is None:
+                del cleaned_parameters["notebook_ids"]
+        
+        # 移除無效的 notebook_id 參數（如果是字符串 'None'）
+        if "notebook_id" in cleaned_parameters:
+            notebook_id_value = cleaned_parameters.get("notebook_id")
+            if notebook_id_value == 'None' or notebook_id_value == 'none':
+                del cleaned_parameters["notebook_id"]
+                logger.warning(
+                    f"[Iteration {iteration}] PageIndex search: Removed invalid notebook_id='None' string"
+                )
+            elif notebook_id_value is None:
+                del cleaned_parameters["notebook_id"]
+        
+        # 確保至少有一個有效的參數：notebook_id, source_ids, 或 document_path
+        has_valid_param = (
+            cleaned_parameters.get("notebook_id") or
+            cleaned_parameters.get("source_ids") or
+            cleaned_parameters.get("document_path")
+        )
+        
+        # 如果沒有有效參數，嘗試從 state 中獲取 notebook_id（作為最後的 fallback）
+        if not has_valid_param:
+            notebook = state.get("notebook")
+            if notebook:
+                if isinstance(notebook, dict) and notebook.get("id"):
+                    cleaned_parameters["notebook_id"] = notebook.get("id")
+                    logger.info(
+                        f"[Iteration {iteration}] PageIndex search: Fallback - Using notebook_id from state (dict): {notebook.get('id')}"
+                    )
+                elif hasattr(notebook, 'id'):
+                    cleaned_parameters["notebook_id"] = notebook.id
+                    logger.info(
+                        f"[Iteration {iteration}] PageIndex search: Fallback - Using notebook_id from state (object): {notebook.id}"
+                    )
+            else:
+                logger.error(
+                    f"[Iteration {iteration}] PageIndex search: No valid parameters found and no notebook in state. "
+                    f"Parameters: {list(cleaned_parameters.keys())}, "
+                    f"State notebook: {bool(state.get('notebook'))}"
+                )
+        else:
+            # 記錄有效的參數
+            logger.info(
+                f"[Iteration {iteration}] PageIndex search: Valid parameters found - "
+                f"notebook_id={bool(cleaned_parameters.get('notebook_id'))}, "
+                f"source_ids={bool(cleaned_parameters.get('source_ids'))}, "
+                f"document_path={bool(cleaned_parameters.get('document_path'))}"
+            )
+    
+    parameters = cleaned_parameters
 
     try:
         # 關鍵修復：添加工具執行前後的日誌，追蹤執行時間
@@ -1256,6 +1445,91 @@ async def execute_tool(
                 "current_tool_calls": [result],
                 "iteration_count": state["iteration_count"] + 1,
             }
+    except ToolNotFoundError as e:
+        # 專門處理工具不存在的情況
+        tool_end_time = time.time()
+        execution_duration = (
+            tool_end_time - tool_start_time if "tool_start_time" in locals() else 0
+        )
+        logger.error(
+            f"[Iteration {iteration}] Tool {tool_name} not found after {execution_duration:.2f}s: {e}"
+        )
+        
+        # 記錄不可用的工具
+        unavailable_tools = state.get("unavailable_tools", [])
+        new_unavailable_tool = None
+        if tool_name not in unavailable_tools:
+            new_unavailable_tool = tool_name  # 只返回新工具，LangGraph 會自動累積
+        
+        # 檢查是否連續失敗多次
+        error_history = state.get("error_history", [])
+        recent_errors = error_history[-3:] if len(error_history) >= 3 else error_history
+        same_tool_errors = [err for err in recent_errors if err.get("tool") == tool_name]
+        
+        if len(same_tool_errors) >= 2:  # 連續 3 次失敗（包括這次）
+            logger.error(f"[Iteration {iteration}] Tool {tool_name} failed 3 times consecutively, forcing stop")
+            return {
+                "unavailable_tools": [new_unavailable_tool] if new_unavailable_tool else [],
+                "error_history": [{
+                    "step": "execute_tool",
+                    "error": f"Tool {tool_name} not found (failed 3 times)",
+                    "tool": tool_name,
+                    "iteration": state["iteration_count"],
+                    "error_details": {
+                        "reason": "工具不存在且連續失敗多次",
+                        "suggestion": "請使用其他可用工具",
+                        "force_stop": True
+                    }
+                }],
+                "final_answer": f"無法完成查詢：工具 {tool_name} 不可用。請嘗試使用其他工具或重新表述問題。",
+                "reasoning_trace": [f"工具 {tool_name} 不存在，已強制停止"],
+                "iteration_count": state["iteration_count"] + 1,
+            }
+        
+        # 正常錯誤處理
+        error_result = {
+            "id": f"error_{tool_name}_{int(time.time())}",
+            "type": "error",
+            "title": f"工具不可用: {tool_name}",
+            "content": f"工具 {tool_name} 不存在或未配置",
+            "error_details": {
+                "reason": "工具不存在",
+                "suggestion": "請使用其他可用工具",
+            },
+            "tool_name": tool_name,
+            "query": parameters.get("query", ""),
+        }
+        
+        return {
+            "unavailable_tools": [new_unavailable_tool] if new_unavailable_tool else [],
+            "search_history": [{
+                "query": parameters.get("query", ""),
+                "tool": tool_name,
+                "result_count": 0,
+                "success": False,
+                "error": f"Tool {tool_name} not found",
+                "timestamp": time.time(),
+            }],
+            "collected_results": [error_result],
+            "current_tool_calls": [{
+                "tool_name": tool_name,
+                "success": False,
+                "data": [],
+                "error": f"Tool {tool_name} not found",
+                "execution_time": execution_duration,
+            }],
+            "error_history": [{
+                "step": "execute_tool",
+                "error": f"Tool {tool_name} not found",
+                "tool": tool_name,
+                "iteration": state["iteration_count"],
+                "error_details": {
+                    "reason": "工具不存在",
+                    "suggestion": "請使用其他可用工具",
+                }
+            }],
+            "iteration_count": state["iteration_count"] + 1,
+        }
     except Exception as e:
         tool_end_time = time.time()
         execution_duration = (

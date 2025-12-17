@@ -224,7 +224,8 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
         session_id: sessionId,
         message,
         context,
-        model_override: modelOverride ?? (currentSession?.model_override ?? undefined)
+        model_override: modelOverride ?? (currentSession?.model_override ?? undefined),
+        notebook_id: notebookId  // Include notebook_id for auto-creating session if not found
       })
 
       if (!response) {
@@ -289,6 +290,15 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
               } else if (data.type === 'complete') {
                 // Stop thinking indicator
                 setIsThinking(false)
+                // If session was auto-created, update currentSessionId
+                if (data.session_id && data.session_id !== sessionId) {
+                  console.log(`Session auto-created: ${sessionId} -> ${data.session_id}`)
+                  setCurrentSessionId(data.session_id)
+                  // Invalidate sessions list to include the new session
+                  queryClient.invalidateQueries({
+                    queryKey: QUERY_KEYS.notebookChatSessions(notebookId)
+                  })
+                }
                 // Final thinking process will be loaded via refetchCurrentSession
               }
             } catch (e) {

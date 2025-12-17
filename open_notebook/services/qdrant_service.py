@@ -644,13 +644,14 @@ class QdrantService:
                 embed_search_start = time.time()
                 
                 def _search_embeddings():
-                    return client.search(
+                    result = client.query_points(
                         collection_name="source_embeddings",
-                        query_vector=query_vector,
+                        query=query_vector,
                         query_filter=query_filter,
                         limit=limit,
                         score_threshold=min_score
                     )
+                    return result.points
                 
                 source_results = await asyncio.to_thread(_search_embeddings)
                 embed_search_duration = time.time() - embed_search_start
@@ -729,13 +730,14 @@ class QdrantService:
                 insight_search_start = time.time()
                 
                 def _search_insights():
-                    return client.search(
+                    result = client.query_points(
                         collection_name="source_insights",
-                        query_vector=query_vector,
+                        query=query_vector,
                         query_filter=query_filter,
                         limit=limit,
                         score_threshold=min_score
                     )
+                    return result.points
                 
                 insight_results = await asyncio.to_thread(_search_insights)
                 insight_search_duration = time.time() - insight_search_start

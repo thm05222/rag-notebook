@@ -208,6 +208,7 @@ export interface SendNotebookChatMessageRequest {
     sources: Array<Record<string, unknown>>
   }
   model_override?: string
+  notebook_id?: string  // Optional: for auto-creating session if not found
 }
 
 export interface BuildContextRequest {
@@ -233,4 +234,5 @@ export interface ChatStreamEvent {
   message?: string
   timestamp?: number
   final_answer?: string
+  session_id?: string  // Optional: new session ID if session was auto-created
 }

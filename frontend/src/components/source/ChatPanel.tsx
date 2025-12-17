@@ -13,7 +13,8 @@ import ReactMarkdown from 'react-markdown'
 import {
   SourceChatMessage,
   SourceChatContextIndicator,
-  BaseChatSession
+  BaseChatSession,
+  AgentThinkingStep
 } from '@/lib/types/api'
 import { ModelSelector } from './ModelSelector'
 import { ContextIndicator } from '@/components/common/ContextIndicator'
@@ -58,7 +59,7 @@ interface ChatPanelProps {
   notebookContextStats?: NotebookContextStats
   notebookId?: string
   // Thinking process props (for streaming)
-  thinkingSteps?: Array<{ step_type: string; timestamp: number; content: string; metadata?: Record<string, unknown> }>
+  thinkingSteps?: AgentThinkingStep[]
   isThinking?: boolean
 }
 

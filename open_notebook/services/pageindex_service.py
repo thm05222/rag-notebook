@@ -1103,6 +1103,9 @@ class PageIndexSearchTool(BaseTool):
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Execute PageIndex search."""
+        # 關鍵修復：在執行前確保 PageIndex 已初始化
+        await self.service._ensure_initialized()
+        
         if not self.service.is_available():
             return {
                 "tool_name": self.name,
