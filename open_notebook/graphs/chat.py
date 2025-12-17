@@ -2575,11 +2575,28 @@ async def initialize_checkpointer(connection: aiosqlite.Connection):
     
     Returns:
         The initialized AsyncSqliteSaver checkpointer instance.
+    
+    Raises:
+        RuntimeError: If checkpointer initialization fails or required methods are missing.
     """
     global memory, graph, _graph_instance
     if memory is None:
         # Create AsyncSqliteSaver directly with the provided connection
         memory = AsyncSqliteSaver(connection)
+        
+        # Ensure database tables are set up
+        # setup() creates the checkpoints table if it doesn't exist
+        # It may raise an exception if tables already exist, which is safe to ignore
+        try:
+            await memory.setup()
+            logger.info("Checkpointer database tables initialized")
+        except Exception as e:
+            # setup() may fail if tables already exist, which is acceptable
+            error_msg = str(e).lower()
+            if "already exists" in error_msg or "table" in error_msg:
+                logger.debug(f"Checkpointer tables may already exist: {e}")
+            else:
+                logger.warning(f"Checkpointer setup() failed: {e}")
         
         # Verify checkpointer type and methods
         checkpointer_type = type(memory).__name__

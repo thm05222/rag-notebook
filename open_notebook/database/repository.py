@@ -1,3 +1,14 @@
+"""
+Database repository functions for SurrealDB operations.
+
+Compatibility Notes:
+- Designed for SurrealDB v2
+- Uses UPSERT for create-or-update operations (v2 requirement)
+- UPDATE only modifies existing records (v2 behavior)
+- Error handling adapted for v2 response formats
+- Handles various error response formats (string, dict, list with error fields)
+"""
+
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -34,7 +45,12 @@ __all__ = [
 
 
 def parse_record_ids(obj: Any) -> Any:
-    """Recursively parse and convert RecordIDs into strings."""
+    """Recursively parse and convert RecordIDs into strings.
+    
+    Handles None, dict, list, and RecordID types safely.
+    """
+    if obj is None:
+        return None
     if isinstance(obj, dict):
         return {k: parse_record_ids(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -58,25 +74,59 @@ db_connection = _db_connection
 async def repo_query(
     query_str: str, vars: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
-    """Execute a SurrealQL query and return the results"""
-
+    """Execute a SurrealQL query and return the results.
+    
+    Handles SurrealDB v2 response formats including error detection
+    in various formats (string, dict, list with error fields).
+    """
     async with db_connection() as connection:
         try:
-            result = parse_record_ids(await connection.query(query_str, vars))
-            if isinstance(result, str):
-                # Check if the error message indicates a not found condition
-                error_msg_lower = result.lower()
+            result = await connection.query(query_str, vars)
+            
+            # Handle None or empty results
+            if result is None:
+                logger.warning(f"Query returned None: {query_str[:200]}")
+                return []
+            
+            # Parse result and check for errors
+            # parse_record_ids handles None by returning None, so check before parsing
+            parsed_result = parse_record_ids(result)
+            
+            # SurrealDB v2 may return errors in different formats
+            # Check if result is an error string
+            if isinstance(parsed_result, str):
+                error_msg_lower = parsed_result.lower()
                 if "not found" in error_msg_lower or "does not exist" in error_msg_lower:
-                    raise NotFoundError(result)
-                raise DatabaseOperationError(result)
-            return result
+                    raise NotFoundError(parsed_result)
+                raise DatabaseOperationError(parsed_result)
+            
+            # Check if result is a list containing error information
+            if isinstance(parsed_result, list):
+                if len(parsed_result) == 0:
+                    return []
+                first_item = parsed_result[0]
+                if isinstance(first_item, dict):
+                    # Check for error fields in the result (SurrealDB v2 error format)
+                    if "error" in first_item or "code" in first_item:
+                        error_msg = str(first_item.get("error", first_item.get("code", "")))
+                        error_msg_lower = error_msg.lower()
+                        if "not found" in error_msg_lower or "does not exist" in error_msg_lower:
+                            raise NotFoundError(error_msg)
+                        raise DatabaseOperationError(error_msg)
+            
+            # Handle None after parsing (shouldn't happen, but defensive)
+            if parsed_result is None:
+                logger.warning(f"Parsed result is None: {query_str[:200]}")
+                return []
+            
+            return parsed_result
+            
         except (NotFoundError, DatabaseOperationError):
             # Re-raise our custom exceptions
             raise
         except Exception as e:
-            logger.error(f"Query: {query_str[:200]} vars: {vars}")
+            logger.error(f"Query failed: {query_str[:200]} | vars: {vars} | Error: {e}")
             logger.exception(e)
-            # Check error message to determine exception type
             error_msg = str(e).lower()
             if "not found" in error_msg or "does not exist" in error_msg:
                 raise NotFoundError(f"Record not found: {str(e)}") from e

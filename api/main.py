@@ -214,6 +214,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize AsyncSqliteSaver checkpointer for chat graph
     # Use standard LangGraph approach: create aiosqlite connection in lifespan
+    # IMPORTANT: db_connection must be in outer scope for shutdown cleanup
     db_connection = None
     try:
         import aiosqlite
@@ -223,23 +224,26 @@ async def lifespan(app: FastAPI):
         
         # Ensure directory exists
         checkpoint_path = os.path.abspath(LANGGRAPH_CHECKPOINT_FILE)
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if checkpoint_dir:  # Only create if dirname is not empty
+            os.makedirs(checkpoint_dir, exist_ok=True)
         
         # Create aiosqlite connection
         db_connection = await aiosqlite.connect(checkpoint_path)
         
-        # Initialize checkpointer with the connection
+        # Initialize checkpointer with the connection (this will call setup() internally)
         await initialize_checkpointer(db_connection)
         logger.success("Chat graph checkpointer initialized successfully")
     except Exception as e:
-        logger.warning(f"Failed to initialize chat graph checkpointer: {e}")
+        logger.error(f"Failed to initialize chat graph checkpointer: {e}")
+        logger.exception(e)
         logger.warning("Chat functionality may not work properly")
         # Close connection if initialization failed
         if db_connection:
             try:
                 await db_connection.close()
-            except Exception:
-                pass
+            except Exception as close_error:
+                logger.warning(f"Error closing checkpointer connection: {close_error}")
             db_connection = None
 
     logger.success("API initialization completed successfully")
@@ -255,15 +259,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     
-    # Cleanup chat graph checkpointer
-    try:
-        from open_notebook.graphs.chat import cleanup_checkpointer
-        # db_connection is captured from the startup scope (before yield)
-        if db_connection:
-            await cleanup_checkpointer(db_connection)
-            logger.info("Chat graph checkpointer cleaned up")
-    except Exception as e:
-        logger.warning(f"Error cleaning up chat graph checkpointer: {e}")
+    # Cleanup chat graph checkpointer connection
+    if db_connection:
+        try:
+            await db_connection.close()
+            logger.info("Chat graph checkpointer connection closed")
+        except Exception as e:
+            logger.warning(f"Error closing checkpointer connection during shutdown: {e}")
     
     # Close database connection pool
     try:
