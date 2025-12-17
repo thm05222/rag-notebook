@@ -12,7 +12,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiosqlite
 from ai_prompter import Prompter
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers.pydantic import PydanticOutputParser
 from langchain_core.runnables import RunnableConfig
 
@@ -41,7 +41,7 @@ class ChatAgenticState(TypedDict):
     """State for Agentic RAG Chat workflow."""
 
     # 對話相關
-    messages: Annotated[list, add_messages]
+    messages: Annotated[list[BaseMessage], add_messages]
     notebook: Optional[Notebook]
     context_config: Optional[dict]  # 用戶選擇的 sources
     conversation_context: Optional[List[Dict[str, str]]]  # 格式化的對話歷史
@@ -534,6 +534,41 @@ async def agent_decision(
     # 獲取 refinement_feedback（如果存在）
     refinement_feedback = state.get("refinement_feedback")
     
+    # Build knowledge base overview (Mental Map) from notebook sources
+    knowledge_base_overview = []
+    notebook = state.get("notebook")
+    if notebook:
+        try:
+            sources = await notebook.get_sources()
+            for source in sources:
+                source_info = {
+                    "id": source.id,
+                    "title": source.title or "Untitled",
+                    "summary": None,
+                    "topics": source.topics or [],
+                    "supports_pageindex": source.pageindex_structure is not None,  # 新增：標記是否支援 PageIndex
+                }
+                
+                # Extract summary from pageindex_structure
+                if source.pageindex_structure:
+                    # Priority 1: Use doc_description if exists
+                    if "doc_description" in source.pageindex_structure:
+                        source_info["summary"] = source.pageindex_structure["doc_description"]
+                    # Priority 2: Extract summary from root node
+                    elif isinstance(source.pageindex_structure, dict):
+                        # PageIndex structure format: {"structure": [...]}
+                        structure = source.pageindex_structure.get("structure", [])
+                        if structure and isinstance(structure, list) and len(structure) > 0:
+                            # Get summary from first root node
+                            first_node = structure[0]
+                            if isinstance(first_node, dict) and "summary" in first_node:
+                                source_info["summary"] = first_node["summary"]
+                
+                knowledge_base_overview.append(source_info)
+        except Exception as e:
+            logger.warning(f"Failed to build knowledge base overview: {e}")
+            knowledge_base_overview = []
+    
     prompt_data = {
         "question": state["question"],
         "iteration_count": state["iteration_count"],
@@ -547,22 +582,29 @@ async def agent_decision(
         "partial_answer": state.get("partial_answer", ""),
         "reasoning_trace": state["reasoning_trace"][-3:],
         "available_tools": available_tools,
-        "conversation_context": state.get("conversation_context", []),
+        # 移除 conversation_context，現在使用原生 Messages 格式
         "error_history": recent_errors,  # 添加錯誤歷史，讓 Agent 知道工具失敗
         "decision_history": state.get("decision_history", [])[
             -5:
         ],  # 最近 5 個決策，幫助避免循環
         "refinement_feedback": refinement_feedback,  # 添加 Refiner 的 feedback
+        "knowledge_base_overview": knowledge_base_overview,  # Knowledge base overview (Mental Map)
     }
 
     parser = PydanticOutputParser(pydantic_object=Decision)
     prompt_data["format_instructions"] = parser.get_format_instructions()
-    system_prompt = Prompter(
+    
+    # 渲染 System Prompt（純指令，不含對話歷史）
+    system_content = Prompter(
         prompt_template="chat_agentic/orchestrator", parser=parser
     ).render(data=prompt_data)
+    system_msg = SystemMessage(content=system_content)
+
+    # 構建 Messages 列表：SystemMessage + 歷史對話
+    messages_payload = [system_msg] + state["messages"]
 
     # Track tokens
-    tokens = token_count(system_prompt)
+    tokens = token_count(system_content)
     new_token_count = state["token_count"] + tokens
 
     try:
@@ -570,14 +612,14 @@ async def agent_decision(
             "model_override"
         )
         model = await provision_langchain_model(
-            system_prompt,
+            str(messages_payload),  # 僅用於日誌
             model_id,
             "orchestrator",
             max_tokens=2000,
             structured=dict(type="json"),
         )
 
-        response = await model.ainvoke(system_prompt)
+        response = await model.ainvoke(messages_payload)
         content = (
             response.content
             if isinstance(response.content, str)
@@ -604,15 +646,17 @@ async def agent_decision(
                     # 將錯誤訊息加入 prompt，讓 LLM 修正
                     prompt_data["parse_error"] = str(e)
                     prompt_data["previous_attempt"] = cleaned_content[:500]  # 保留前500字符作為參考
-                    system_prompt = Prompter(
+                    system_content = Prompter(
                         prompt_template="chat_agentic/orchestrator", parser=parser
                     ).render(data=prompt_data)
+                    system_msg = SystemMessage(content=system_content)
+                    messages_payload = [system_msg] + state["messages"]
                     
                     # 重新生成
                     logger.info(
                         f"[Iteration {iteration}] Retrying decision generation with parse error feedback..."
                     )
-                    response = await model.ainvoke(system_prompt)
+                    response = await model.ainvoke(messages_payload)
                     content = (
                         response.content
                         if isinstance(response.content, str)
@@ -803,6 +847,47 @@ async def execute_tool(
     current_decision = state.get("current_decision", {})
     tool_name = current_decision.get("tool_name")
     parameters = current_decision.get("parameters", {})
+
+    # [新增] 自動降級邏輯：檢查 PageIndex 支援情況
+    if tool_name == "pageindex_search":
+        source_ids = parameters.get("source_ids")
+        notebook_id = parameters.get("notebook_id")
+        
+        # 檢查指定的 sources 是否支援 PageIndex
+        unsupported_sources = []
+        if source_ids:
+            notebook = state.get("notebook")
+            if notebook:
+                try:
+                    sources = await notebook.get_sources()
+                    source_map = {s.id: s for s in sources}
+                    for source_id in source_ids:
+                        source = source_map.get(source_id)
+                        if source and not source.pageindex_structure:
+                            unsupported_sources.append(source_id)
+                except Exception as e:
+                    logger.warning(f"Failed to check PageIndex support: {e}")
+        
+        # 如果有不支援的 sources，自動降級到 vector_search
+        if unsupported_sources:
+            iteration = state.get("iteration_count", 0)
+            logger.info(
+                f"[Iteration {iteration}] Auto-degrading to vector_search: Sources {unsupported_sources} do not support PageIndex. "
+                f"Original tool: {tool_name}, query: {parameters.get('query', 'N/A')}"
+            )
+            tool_name = "vector_search"
+            # 確保參數兼容（vector_search 使用 query 和 limit）
+            parameters = {
+                "query": parameters.get("query", ""),
+                "limit": parameters.get("limit", 10),
+            }
+            # 更新 decision 以便後續邏輯使用
+            current_decision = {
+                **current_decision,
+                "tool_name": tool_name,
+                "parameters": parameters,
+                "reasoning": f"Auto-degraded from pageindex_search to vector_search: Sources {unsupported_sources} do not support PageIndex. " + current_decision.get("reasoning", ""),
+            }
 
     # 添加日誌以追蹤工具執行（關鍵修復）
     iteration = state.get("iteration_count", 0)
@@ -1372,27 +1457,31 @@ async def refine_query(
         "question": state["question"],
         "search_history": state["search_history"][-5:],
         "collected_results": state["collected_results"],
-        "conversation_context": state.get("conversation_context", []),
+        # 移除 conversation_context，現在使用原生 Messages 格式
     }
 
     parser = PydanticOutputParser(pydantic_object=Decision)
-    system_prompt = Prompter(
+    system_content = Prompter(
         prompt_template="chat_agentic/self_correction", parser=parser
     ).render(data=prompt_data)
+    system_msg = SystemMessage(content=system_content)
+
+    # 構建 Messages 列表：SystemMessage + 歷史對話
+    messages_payload = [system_msg] + state["messages"]
 
     try:
         model_id = config.get("configurable", {}).get("model_id") or state.get(
             "model_override"
         )
         model = await provision_langchain_model(
-            system_prompt,
+            str(messages_payload),  # 僅用於日誌
             model_id,
             "correction",
             max_tokens=1000,
             structured=dict(type="json"),
         )
 
-        response = await model.ainvoke(system_prompt)
+        response = await model.ainvoke(messages_payload)
         content = (
             response.content
             if isinstance(response.content, str)
@@ -1516,19 +1605,23 @@ async def synthesize_answer(
     prompt_data = {
         "question": state["question"],
         "collected_results": state["collected_results"],
-        "conversation_context": state.get("conversation_context", []),
+        # 移除 conversation_context，現在使用原生 Messages 格式
     }
 
-    system_prompt = Prompter(prompt_template="chat_agentic/refiner").render(
+    system_content = Prompter(prompt_template="chat_agentic/refiner").render(
         data=prompt_data
     )
+    system_msg = SystemMessage(content=system_content)
+
+    # 構建 Messages 列表：SystemMessage + 歷史對話
+    messages_payload = [system_msg] + state["messages"]
 
     try:
         model_id = config.get("configurable", {}).get("model_id") or state.get(
             "model_override"
         )
         model = await provision_langchain_model(
-            system_prompt,
+            str(messages_payload),  # 僅用於日誌
             model_id,
             "refiner",
             max_tokens=4000,
@@ -1538,10 +1631,10 @@ async def synthesize_answer(
             f"[Iteration {iteration}] synthesize_answer: Invoking LLM for answer generation..."
         )
         logger.debug(
-            f"[Iteration {iteration}] synthesize_answer: Prompt length: {len(system_prompt)} chars"
+            f"[Iteration {iteration}] synthesize_answer: Prompt length: {len(system_content)} chars"
         )
 
-        response = await model.ainvoke(system_prompt)
+        response = await model.ainvoke(messages_payload)
         content = (
             response.content
             if isinstance(response.content, str)
@@ -2027,13 +2120,17 @@ async def synthesize_answer_node(
     parser = PydanticOutputParser(pydantic_object=SynthesizeAnswer)
     prompt_data = {
         "question": state.get("question"),
-        "conversation_context": state.get("conversation_context"),
+        # 移除 conversation_context，現在使用原生 Messages 格式
         "collected_results": state.get("collected_results"),
         "format_instructions": parser.get_format_instructions(),
     }
-    system_prompt = Prompter(prompt_template="basic_chat/synthesize").render(
+    system_content = Prompter(prompt_template="basic_chat/synthesize").render(
         data=prompt_data
     )
+    system_msg = SystemMessage(content=system_content)
+
+    # 構建 Messages 列表：SystemMessage + 歷史對話
+    messages_payload = [system_msg] + state["messages"]
 
     response = SynthesizeAnswer(answer="Empty Answer")
     try:
@@ -2041,7 +2138,20 @@ async def synthesize_answer_node(
             "model_override"
         )
 
-        cleaned_content = await ainvoke_for_answer(model_id, system_prompt)
+        # 使用 Messages 格式調用模型
+        model = await provision_langchain_model(
+            str(messages_payload),  # 僅用於日誌
+            model_id,
+            "refiner",
+            max_tokens=4000,
+        )
+        ai_response = await model.ainvoke(messages_payload)
+        cleaned_content = (
+            ai_response.content
+            if isinstance(ai_response.content, str)
+            else str(ai_response.content)
+        )
+        cleaned_content = clean_thinking_content(cleaned_content)
         logger.info(f"[Iteration {iteration}]: output is {cleaned_content[:100]}")
         response = parser.parse(cleaned_content)
 

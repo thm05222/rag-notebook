@@ -18,20 +18,38 @@ interface DefaultModelsSectionProps {
 }
 
 interface DefaultConfig {
-  key: keyof ModelDefaults
+  key: keyof ModelDefaults | string // Allow string for nested keys like 'role_default_models.orchestrator'
   label: string
   description: string
   modelType: 'language' | 'embedding'
   required?: boolean
+  isNested?: boolean // Flag to indicate nested object key
 }
 
 const defaultConfigs: DefaultConfig[] = [
   {
-    key: 'default_chat_model',
-    label: 'Chat Model',
-    description: 'Used for chat conversations',
+    key: 'role_default_models.orchestrator',
+    label: 'Orchestrator Model',
+    description: 'Used for decision-making and planning',
     modelType: 'language',
-    required: true
+    required: true,
+    isNested: true
+  },
+  {
+    key: 'role_default_models.executor',
+    label: 'Executor Model',
+    description: 'Used for tool execution and function calling',
+    modelType: 'language',
+    required: true,
+    isNested: true
+  },
+  {
+    key: 'role_default_models.refiner',
+    label: 'Refiner Model',
+    description: 'Used for answer synthesis and refinement',
+    modelType: 'language',
+    required: true,
+    isNested: true
   },
   {
     key: 'default_transformation_model',
@@ -85,7 +103,7 @@ export function DefaultModelsSection({ models, defaults }: DefaultModelsSectionP
     }
   }, [defaults, setValue])
 
-  const handleChange = (key: keyof ModelDefaults, value: string) => {
+  const handleChange = (key: string, value: string) => {
     // Special handling for embedding model changes
     if (key === 'default_embedding_model') {
       const currentEmbeddingModel = defaults[key]
@@ -93,7 +111,7 @@ export function DefaultModelsSection({ models, defaults }: DefaultModelsSectionP
       // Only show dialog if there's an existing embedding model and it's changing
       if (currentEmbeddingModel && currentEmbeddingModel !== value) {
         setPendingEmbeddingChange({
-          key,
+          key: key as keyof ModelDefaults,
           value,
           oldModelId: currentEmbeddingModel,
           newModelId: value
@@ -103,8 +121,21 @@ export function DefaultModelsSection({ models, defaults }: DefaultModelsSectionP
       }
     }
 
+    // Handle nested role_default_models keys
+    if (key.startsWith('role_default_models.')) {
+      const role = key.split('.')[1] as 'orchestrator' | 'executor' | 'refiner'
+      const currentRoleModels = defaults.role_default_models || {}
+      const newRoleModels = {
+        ...currentRoleModels,
+        [role]: value || null
+      }
+      const newDefaults = { role_default_models: newRoleModels }
+      updateDefaults.mutate(newDefaults)
+      return
+    }
+
     // For all other changes or new embedding model assignment
-    const newDefaults = { [key]: value || null }
+    const newDefaults = { [key]: value || null } as Partial<ModelDefaults>
     updateDefaults.mutate(newDefaults)
   }
 
@@ -127,10 +158,26 @@ export function DefaultModelsSection({ models, defaults }: DefaultModelsSectionP
     return models.filter(model => model.type === type)
   }
 
+  const getValueForConfig = (config: DefaultConfig): string | null | undefined => {
+    if (config.isNested && config.key.startsWith('role_default_models.')) {
+      const role = config.key.split('.')[1] as 'orchestrator' | 'executor' | 'refiner'
+      return defaults.role_default_models?.[role] ?? null
+    }
+    // For non-nested keys, ensure we only access string properties
+    const key = config.key as keyof ModelDefaults
+    if (key === 'role_default_models') {
+      // This shouldn't happen, but handle it gracefully
+      return null
+    }
+    const value = defaults[key]
+    // Ensure we return a string or null, not the nested object
+    return (typeof value === 'string' ? value : null) ?? null
+  }
+
   const missingRequired = defaultConfigs
     .filter(config => {
       if (!config.required) return false
-      const value = defaults[config.key]
+      const value = getValueForConfig(config)
       if (!value) return true
       // Check if the model still exists
       const modelsOfType = models.filter(m => m.type === config.modelType)
@@ -160,7 +207,9 @@ export function DefaultModelsSection({ models, defaults }: DefaultModelsSectionP
         <div className="grid gap-6 md:grid-cols-2">
           {defaultConfigs.map((config) => {
             const availableModels = getModelsForType(config.modelType)
-            const currentValue = watch(config.key) || undefined
+            // Always use getValueForConfig to ensure consistent string | null | undefined return type
+            const configValue = getValueForConfig(config)
+            const currentValue: string | undefined = configValue || undefined
             
             // Check if the current value exists in available models
             const isValidModel = currentValue && availableModels.some(m => m.id === currentValue)

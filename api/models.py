@@ -128,6 +128,7 @@ class DefaultModelsResponse(BaseModel):
     large_context_model: Optional[str] = None
     default_embedding_model: Optional[str] = None
     default_tools_model: Optional[str] = None
+    role_default_models: Optional[Dict[str, Optional[str]]] = None
 
 
 class ProviderAvailabilityResponse(BaseModel):
@@ -364,6 +365,9 @@ class SourceResponse(BaseModel):
     error_message: Optional[str] = None
     # Notebook associations
     notebooks: Optional[List[str]] = None
+    # PageIndex fields
+    has_pageindex: bool = False
+    pageindex_built_at: Optional[str] = None
 
 
 class SourceListResponse(BaseModel):
@@ -384,6 +388,9 @@ class SourceListResponse(BaseModel):
     # Processing status and error tracking
     processing_status: Optional[str] = None
     error_message: Optional[str] = None
+    # PageIndex fields
+    has_pageindex: bool = False
+    pageindex_built_at: Optional[str] = None
 
 
 # Context API models

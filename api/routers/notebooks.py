@@ -281,6 +281,9 @@ async def build_pageindex_for_notebook(notebook_id: str):
         
         logger.info(f"Building PageIndex for notebook {notebook_id}")
         
+        # Ensure PageIndex service is initialized before checking availability
+        await pageindex_service._ensure_initialized()
+        
         if not pageindex_service.is_available():
             logger.error(f"PageIndex is not available for notebook {notebook_id}")
             raise HTTPException(
@@ -368,11 +371,28 @@ async def build_pageindex_for_notebook(notebook_id: str):
                     result_item["reason"] = "built from full_text"
                     success_count += 1
             except Exception as e:
-                logger.error(f"Failed to build PageIndex for source {source.id}: {e}")
-                logger.exception(e)
-                result_item["status"] = "error"
-                result_item["error"] = str(e)
-                failed_count += 1
+                # 檢查是否是因為文件結構不適合 PageIndex
+                error_msg = str(e)
+                is_unsuitable = (
+                    "hierarchical structure" in error_msg.lower() or 
+                    "empty structure" in error_msg.lower() or
+                    "not have a hierarchical structure" in error_msg.lower()
+                )
+                
+                if is_unsuitable:
+                    # 這是預期的失敗（文件不適合 PageIndex），標記為 not_suitable
+                    logger.info(f"PageIndex not suitable for source {source.id}: {error_msg}")
+                    result_item["status"] = "not_suitable"
+                    result_item["reason"] = "Document structure not suitable for PageIndex"
+                    result_item["error"] = error_msg
+                    skipped_count += 1  # 計為 skipped 而不是 failed
+                else:
+                    # 其他錯誤，正常記錄為失敗
+                    logger.error(f"Failed to build PageIndex for source {source.id}: {e}")
+                    logger.exception(e)
+                    result_item["status"] = "error"
+                    result_item["error"] = error_msg
+                    failed_count += 1
             
             results.append(result_item)
         

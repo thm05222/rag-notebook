@@ -294,11 +294,19 @@ class RecordModel(BaseModel):
                     if isinstance(row, dict):
                         for key, value in row.items():
                             if hasattr(self, key):
+                                # Handle None values for dict fields - use default if None
+                                if value is None and key == "role_default_models":
+                                    # Keep default value from Field(default_factory)
+                                    continue
                                 object.__setattr__(self, key, value)
                 elif isinstance(result, dict):
                     # Direct dict response
                     for key, value in result.items():
                         if hasattr(self, key):
+                            # Handle None values for dict fields - use default if None
+                            if value is None and key == "role_default_models":
+                                # Keep default value from Field(default_factory)
+                                continue
                             object.__setattr__(self, key, value)
 
             object.__setattr__(self, "_db_loaded", True)

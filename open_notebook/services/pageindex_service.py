@@ -142,6 +142,7 @@ class PageIndexService:
             return None
         
         # 如果是字典且包含 'structure' key，提取 structure
+        original_structure = structure
         if isinstance(structure, dict) and 'structure' in structure:
             structure = structure['structure']
         
@@ -149,7 +150,13 @@ class PageIndexService:
         if isinstance(structure, list):
             # 驗證列表中的每個元素都是字典
             if len(structure) == 0:
-                logger.warning("Structure is an empty list")
+                logger.warning(
+                    f"Structure is an empty list. "
+                    f"Original structure type: {type(original_structure).__name__}, "
+                    f"value: {str(original_structure)[:200]}. "
+                    f"This may indicate that the document does not have a hierarchical structure "
+                    f"suitable for PageIndex (e.g., no headings or sections)."
+                )
                 return None
             if all(isinstance(item, dict) for item in structure):
                 return structure
@@ -565,15 +572,33 @@ class PageIndexService:
                 # 標準化和驗證結構
                 normalized = self._normalize_structure(tree_result)
                 if not normalized:
-                    error_details = f"tree_result type: {type(tree_result)}, value: {str(tree_result)[:500] if tree_result else 'None'}"
-                    logger.error(f"Failed to normalize PageIndex structure for source {source_id}. {error_details}")
-                    raise ToolExecutionError(
-                        f"Failed to normalize PageIndex structure for source {source_id}. "
-                        f"Received type: {type(tree_result).__name__}, "
-                        f"expected list or dict. This may indicate an issue with md_to_tree output. "
-                        f"Content length: {content_length} chars. "
-                        f"Please check if the source content is sufficient for PageIndex processing."
-                    )
+                    # 檢查是否是空結構的情況
+                    structure_value = None
+                    if isinstance(tree_result, dict) and 'structure' in tree_result:
+                        structure_value = tree_result['structure']
+                    
+                    if isinstance(structure_value, list) and len(structure_value) == 0:
+                        # 空結構 - 文檔可能沒有適合 PageIndex 的層次結構
+                        raise ToolExecutionError(
+                            f"PageIndex could not build a structure for source {source_id}. "
+                            f"The document may not have a hierarchical structure suitable for PageIndex "
+                            f"(e.g., no headings, sections, or chapters). "
+                            f"Content length: {content_length} chars. "
+                            f"PageIndex works best with structured documents like financial reports, "
+                            f"legal documents, academic papers, or technical manuals with clear headings. "
+                            f"Consider using vector search or text search instead for this document."
+                        )
+                    else:
+                        # 其他標準化失敗的情況
+                        error_details = f"tree_result type: {type(tree_result)}, value: {str(tree_result)[:500] if tree_result else 'None'}"
+                        logger.error(f"Failed to normalize PageIndex structure for source {source_id}. {error_details}")
+                        raise ToolExecutionError(
+                            f"Failed to normalize PageIndex structure for source {source_id}. "
+                            f"Received type: {type(tree_result).__name__}, "
+                            f"expected list or dict. This may indicate an issue with md_to_tree output. "
+                            f"Content length: {content_length} chars. "
+                            f"Please check if the source content is sufficient for PageIndex processing."
+                        )
                 
                 if not self._validate_structure(normalized):
                     raise ToolExecutionError(f"PageIndex structure validation failed for source {source_id}")

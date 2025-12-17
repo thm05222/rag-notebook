@@ -8,14 +8,6 @@ You must act as a strict fact-checker. If the information is not in the context,
 # USER QUESTION
 {{question}}
 
-{% if conversation_context %}
-# CONVERSATION CONTEXT
-{% for turn in conversation_context %}
-User: {{turn.user}}
-Assistant: {{turn.assistant}}
-{% endfor %}
-{% endif %}
-
 # RETRIEVED CONTEXT
 
 {% if collected_results %}

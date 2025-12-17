@@ -203,6 +203,23 @@ async def get_default_models():
             defaults.default_tools_model = None  # type: ignore[attr-defined]
             needs_update = True
         
+        # Check and clean role_default_models for invalid references
+        role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
+        cleaned_role_models = False
+        if role_models:
+            updated_role_models = {}
+            for role, model_id in role_models.items():
+                if model_id and model_id not in valid_model_ids:
+                    logger.warning(f"Cleaning up invalid role_default_models[{role}] reference: {model_id}")
+                    updated_role_models[role] = None
+                    cleaned_role_models = True
+                else:
+                    updated_role_models[role] = model_id
+            
+            if cleaned_role_models:
+                defaults.role_default_models = updated_role_models  # type: ignore[attr-defined]
+                needs_update = True
+        
         # Update defaults if any fields were cleaned
         if needs_update:
             await defaults.update()
@@ -217,6 +234,7 @@ async def get_default_models():
             large_context_model=defaults.large_context_model,  # type: ignore[attr-defined]
             default_embedding_model=defaults.default_embedding_model,  # type: ignore[attr-defined]
             default_tools_model=defaults.default_tools_model,  # type: ignore[attr-defined]
+            role_default_models=defaults.role_default_models,  # type: ignore[attr-defined]
         )
     except Exception as e:
         logger.error(f"Error fetching default models: {str(e)}")
@@ -267,6 +285,24 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
             cleaned_fields.append("default_tools_model")
             needs_update = True
         
+        # Check and clean role_default_models for invalid references
+        role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
+        cleaned_role_models = False
+        if role_models:
+            updated_role_models = {}
+            for role, model_id in role_models.items():
+                if model_id and model_id not in valid_model_ids:
+                    logger.warning(f"Cleaning up invalid role_default_models[{role}] reference: {model_id}")
+                    updated_role_models[role] = None
+                    cleaned_role_models = True
+                else:
+                    updated_role_models[role] = model_id
+            
+            if cleaned_role_models:
+                defaults.role_default_models = updated_role_models  # type: ignore[attr-defined]
+                cleaned_fields.append("role_default_models")
+                needs_update = True
+        
         if cleaned_fields:
             logger.info(f"Cleaned up {len(cleaned_fields)} invalid model reference(s) before update: {', '.join(cleaned_fields)}")
         
@@ -282,6 +318,26 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
         if defaults_data.default_tools_model is not None:
             defaults.default_tools_model = defaults_data.default_tools_model  # type: ignore[attr-defined]
         
+        # Update role_default_models if provided
+        if defaults_data.role_default_models is not None:
+            logger.info(f"Updating role_default_models: {defaults_data.role_default_models}")
+            # Validate all model IDs in role_default_models
+            for role, model_id in defaults_data.role_default_models.items():
+                if model_id and model_id not in valid_model_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid model ID '{model_id}' for role '{role}'. Model does not exist."
+                    )
+            
+            # Merge with existing role_default_models (preserve existing roles not in update)
+            existing_role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
+            logger.debug(f"Existing role_default_models: {existing_role_models}")
+            merged_role_models = {**existing_role_models}
+            for role, model_id in defaults_data.role_default_models.items():
+                merged_role_models[role] = model_id
+            logger.info(f"Merged role_default_models: {merged_role_models}")
+            defaults.role_default_models = merged_role_models  # type: ignore[attr-defined]
+        
         # Update if we cleaned invalid references or if user provided updates
         if needs_update or (
             defaults_data.default_chat_model is not None
@@ -289,6 +345,7 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
             or defaults_data.large_context_model is not None
             or defaults_data.default_embedding_model is not None
             or defaults_data.default_tools_model is not None
+            or defaults_data.role_default_models is not None
         ):
             await defaults.update()
             
@@ -302,6 +359,7 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
             large_context_model=defaults.large_context_model,  # type: ignore[attr-defined]
             default_embedding_model=defaults.default_embedding_model,  # type: ignore[attr-defined]
             default_tools_model=defaults.default_tools_model,  # type: ignore[attr-defined]
+            role_default_models=defaults.role_default_models,  # type: ignore[attr-defined]
         )
     except HTTPException:
         raise
@@ -337,6 +395,21 @@ async def cleanup_invalid_model_references():
                 cleaned_fields.append(f"{display_name} (ID: {model_id})")
                 logger.info(f"Cleaned up invalid model reference: {display_name} = {model_id}")
         
+        # Check and clean role_default_models
+        role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
+        if role_models:
+            updated_role_models = {}
+            for role, model_id in role_models.items():
+                if model_id and model_id not in valid_model_ids:
+                    updated_role_models[role] = None
+                    cleaned_fields.append(f"role_default_models[{role}] (ID: {model_id})")
+                    logger.info(f"Cleaned up invalid role model reference: {role} = {model_id}")
+                else:
+                    updated_role_models[role] = model_id
+            
+            if any(role_models.get(role) != updated_role_models.get(role) for role in role_models.keys()):
+                defaults.role_default_models = updated_role_models  # type: ignore[attr-defined]
+        
         # Update defaults if any fields were cleaned
         if cleaned_fields:
             await defaults.update()
@@ -356,6 +429,7 @@ async def cleanup_invalid_model_references():
             large_context_model=defaults.large_context_model,  # type: ignore[attr-defined]
             default_embedding_model=defaults.default_embedding_model,  # type: ignore[attr-defined]
             default_tools_model=defaults.default_tools_model,  # type: ignore[attr-defined]
+            role_default_models=defaults.role_default_models,  # type: ignore[attr-defined]
         )
     except Exception as e:
         logger.error(f"Error cleaning up invalid model references: {str(e)}")

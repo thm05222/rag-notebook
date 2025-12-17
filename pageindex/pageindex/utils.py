@@ -19,6 +19,16 @@ from types import SimpleNamespace as config
 
 CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
 
+# Initialize OCR engine at module level (avoid repeated initialization)
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    _ocr_engine = RapidOCR()
+    _has_ocr = True
+except ImportError:
+    _ocr_engine = None
+    _has_ocr = False
+    logging.warning("RapidOCR not found. OCR capability disabled. Install with: pip install rapidocr-onnxruntime")
+
 def count_tokens(text, model=None):
     if not text:
         return 0
@@ -428,10 +438,52 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
         elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
             doc = pymupdf.open(pdf_path)
         page_list = []
-        for page in doc:
+        
+        # OCR threshold: trigger OCR if text length is below this value
+        OCR_THRESHOLD = 50
+        
+        for i, page in enumerate(doc):
+            # 1. First stage: Fast text extraction
             page_text = page.get_text()
+            cleaned_text = page_text.strip()
+            
+            # 2. Check if OCR is needed
+            # Conditions: text is sparse (< threshold) AND OCR engine is available
+            if len(cleaned_text) < OCR_THRESHOLD and _has_ocr:
+                try:
+                    # Check if page contains images (avoid OCR on blank pages)
+                    images = page.get_images()
+                    # Trigger OCR if: has images OR text is extremely sparse (< 10 chars)
+                    if images or len(cleaned_text) < 10:
+                        logging.info(f"Page {i+1}: Text sparse ({len(cleaned_text)} chars). Running CPU OCR...")
+                        
+                        # Convert page to image (Matrix=2 means 2x zoom, ~144 DPI)
+                        pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                        img_bytes = pix.tobytes("png")
+                        
+                        # Execute OCR
+                        ocr_result, _ = _ocr_engine(img_bytes)
+                        
+                        if ocr_result:
+                            # Extract text from OCR results
+                            # RapidOCR returns format: [[box, text, score], ...]
+                            ocr_text = "\n".join([res[1] for res in ocr_result if len(res) > 1])
+                            
+                            # Strategy: Use OCR result if it's better than original extraction
+                            if len(ocr_text.strip()) > len(cleaned_text):
+                                page_text = ocr_text
+                                logging.info(f"OCR successful for page {i+1}: Found {len(ocr_text)} chars")
+                            else:
+                                logging.debug(f"OCR result not better than original for page {i+1}, keeping original")
+                except Exception as e:
+                    logging.warning(f"OCR failed for page {i+1}: {e}")
+                    # On error, keep original text (don't break the process)
+            
+            # 3. Calculate token length and store
             token_length = len(enc.encode(page_text))
             page_list.append((page_text, token_length))
+        
+        doc.close()
         return page_list
     else:
         raise ValueError(f"Unsupported PDF parser: {pdf_parser}")

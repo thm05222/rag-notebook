@@ -29,11 +29,15 @@ export interface SourceListResponse {
   // Processing status and error tracking
   processing_status?: string
   error_message?: string
+  // PageIndex fields
+  has_pageindex?: boolean
+  pageindex_built_at?: string | null
 }
 
 export interface SourceDetailResponse extends SourceListResponse {
   full_text: string
   notebooks?: string[]  // List of notebook IDs this source is linked to
+  // PageIndex fields are inherited from SourceListResponse
 }
 
 export type SourceResponse = SourceDetailResponse

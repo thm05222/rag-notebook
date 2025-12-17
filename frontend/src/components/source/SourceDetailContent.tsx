@@ -47,12 +47,14 @@ import {
   Database,
   AlertCircle,
   MessageSquare,
+  FileText,
 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 import { toast } from 'sonner'
 import { SourceInsightDialog } from '@/components/source/SourceInsightDialog'
 import { NotebookAssociations } from '@/components/source/NotebookAssociations'
 import { ConfirmDialog } from '@/components/common/ConfirmDialog'
+import { useBuildPageIndex } from '@/lib/hooks/use-sources'
 
 interface SourceDetailContentProps {
   sourceId: string
@@ -77,6 +79,7 @@ export function SourceDetailContent({
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [isEmbedding, setIsEmbedding] = useState(false)
+  const [isBuildingPageIndex, setIsBuildingPageIndex] = useState(false)
   const [isDownloadingFile, setIsDownloadingFile] = useState(false)
   const [fileAvailable, setFileAvailable] = useState<boolean | null>(null)
   const [selectedInsight, setSelectedInsight] = useState<SourceInsightResponse | null>(null)
@@ -244,6 +247,42 @@ export function SourceDetailContent({
       })
     } finally {
       setIsEmbedding(false)
+    }
+  }
+
+  const buildPageIndex = useBuildPageIndex()
+
+  const handleBuildPageIndex = async () => {
+    if (!source) return
+
+    try {
+      setIsBuildingPageIndex(true)
+      await buildPageIndex.mutateAsync(sourceId)
+      toast.success('PageIndex building started')
+      await fetchSource()
+    } catch (err) {
+      console.error('Failed to build PageIndex:', err)
+      
+      // Extract detailed error message from API response
+      let errorMessage = 'Failed to build PageIndex'
+      if (isAxiosError(err)) {
+        if (err.response?.data?.detail) {
+          errorMessage = err.response.data.detail
+        } else if (err.response?.data?.message) {
+          errorMessage = err.response.data.message
+        } else if (err.message) {
+          errorMessage = err.message
+        }
+      } else if (err instanceof Error) {
+        errorMessage = err.message
+      }
+      
+      toast.error(errorMessage, {
+        description: 'Please check the browser console for more details',
+        duration: 10000
+      })
+    } finally {
+      setIsBuildingPageIndex(false)
     }
   }
 
@@ -690,6 +729,29 @@ export function SourceDetailContent({
                         >
                           <Database className="mr-2 h-4 w-4" />
                           {isEmbedding ? 'Embedding...' : 'Embed Content'}
+                        </Button>
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {/* PageIndex Alert */}
+                {!source.has_pageindex && (
+                  <Alert>
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertTitle>
+                      PageIndex Not Built
+                    </AlertTitle>
+                    <AlertDescription>
+                      This content hasn&apos;t been indexed with PageIndex. PageIndex enables reasoning-based hierarchical search for long documents, ideal for financial reports, legal documents, and technical manuals.
+                      <div className="mt-3">
+                        <Button
+                          onClick={handleBuildPageIndex}
+                          disabled={isBuildingPageIndex || buildPageIndex.isPending}
+                          size="sm"
+                        >
+                          <FileText className="mr-2 h-4 w-4" />
+                          {isBuildingPageIndex || buildPageIndex.isPending ? 'Building...' : 'Build PageIndex'}
                         </Button>
                       </div>
                     </AlertDescription>

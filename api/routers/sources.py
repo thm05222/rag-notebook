@@ -206,7 +206,7 @@ async def get_sources(
             # Query sources for specific notebook - include command field
             # Note: embedded status will be calculated in Python from Qdrant
             query = f"""
-                SELECT id, asset, created, title, updated, topics, command,
+                SELECT id, asset, created, title, updated, topics, command, pageindex_structure, pageindex_built_at,
                 (SELECT VALUE count() FROM source_insight WHERE source = $parent.id GROUP ALL)[0].count OR 0 AS insights_count
                 FROM (select value in from reference where out=$notebook_id)
                 {order_clause}
@@ -223,7 +223,7 @@ async def get_sources(
             # Query all sources - include command field
             # Note: embedded status will be calculated in Python from Qdrant
             query = f"""
-                SELECT id, asset, created, title, updated, topics, command,
+                SELECT id, asset, created, title, updated, topics, command, pageindex_structure, pageindex_built_at,
                 (SELECT VALUE count() FROM source_insight WHERE source = $parent.id GROUP ALL)[0].count OR 0 AS insights_count
                 FROM source
                 {order_clause}
@@ -349,6 +349,10 @@ async def get_sources(
                 # Command exists but status couldn't be fetched
                 status = "unknown"
 
+            # Extract PageIndex fields
+            pageindex_structure = row.get("pageindex_structure")
+            pageindex_built_at = row.get("pageindex_built_at")
+            
             response_list.append(
                 SourceListResponse(
                     id=row["id"],
@@ -373,6 +377,9 @@ async def get_sources(
                     command_id=command_id,
                     status=status,
                     processing_info=processing_info,
+                    # PageIndex fields
+                    has_pageindex=pageindex_structure is not None,
+                    pageindex_built_at=str(pageindex_built_at) if pageindex_built_at else None,
                 )
             )
 
@@ -683,6 +690,9 @@ async def build_pageindex_for_source(source_id: str):
         from open_notebook.services.pageindex_service import pageindex_service
         from open_notebook.database.repository import ensure_record_id
         
+        # Ensure PageIndex service is initialized before checking availability
+        await pageindex_service._ensure_initialized()
+        
         if not pageindex_service.is_available():
             raise HTTPException(
                 status_code=503, 
@@ -714,11 +724,31 @@ async def build_pageindex_for_source(source_id: str):
                 "source_title": source.title
             }
         except Exception as e:
-            logger.error(f"Failed to build PageIndex for source {source_id}: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to build PageIndex: {str(e)}"
+            # 檢查是否是因為文件結構不適合 PageIndex
+            error_msg = str(e)
+            is_unsuitable = (
+                "hierarchical structure" in error_msg.lower() or 
+                "empty structure" in error_msg.lower() or
+                "not have a hierarchical structure" in error_msg.lower()
             )
+            
+            if is_unsuitable:
+                # 這是預期的失敗（文件不適合 PageIndex），返回警告而不是錯誤
+                logger.info(f"PageIndex not suitable for source {source_id}: {error_msg}")
+                return {
+                    "status": "not_suitable",
+                    "message": "PageIndex is not suitable for this document type. Use vector search instead.",
+                    "source_id": source_id,
+                    "source_title": source.title,
+                    "reason": error_msg
+                }
+            else:
+                # 其他錯誤，正常拋出
+                logger.error(f"Failed to build PageIndex for source {source_id}: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to build PageIndex: {str(e)}"
+                )
             
     except HTTPException:
         raise
@@ -823,6 +853,9 @@ async def get_source(source_id: str):
             error_message=source.error_message,
             # Notebook associations
             notebooks=notebook_ids,
+            # PageIndex fields
+            has_pageindex=source.pageindex_structure is not None,
+            pageindex_built_at=str(source.pageindex_built_at) if source.pageindex_built_at else None,
         )
     except HTTPException:
         raise

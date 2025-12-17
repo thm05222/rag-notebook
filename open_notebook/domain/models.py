@@ -41,8 +41,19 @@ class DefaultModels(RecordModel):
     default_embedding_model: Optional[str] = None
     default_tools_model: Optional[str] = None
     
+    # Role-specific default model IDs (direct model assignment)
+    # Maps role names directly to model IDs - if set, takes precedence over role_default_types
+    role_default_models: Dict[str, Optional[str]] = Field(
+        default_factory=lambda: {
+            "orchestrator": None,
+            "executor": None,
+            "refiner": None,
+        }
+    )
+    
     # Role-specific default model type mappings
     # Maps role names to default model types (chat, tools, transformation, embedding)
+    # Used as fallback if role_default_models is not set (deprecated - will be removed in future)
     role_default_types: Dict[str, str] = Field(
         default_factory=lambda: {
             "orchestrator": "tools",
@@ -195,6 +206,22 @@ class ModelManager:
                 self._default_models.default_tools_model = None  # type: ignore[attr-defined]
                 cleaned_fields.append("default_tools_model")
                 needs_update = True
+            
+            # Check and clean role_default_models for invalid references
+            role_models = self._default_models.role_default_models or {}  # type: ignore[attr-defined]
+            if role_models:
+                updated_role_models = {}
+                for role, model_id in role_models.items():
+                    if model_id and model_id not in valid_model_ids:
+                        logger.warning(f"Auto-cleaning invalid role_default_models[{role}] reference: {model_id}")
+                        updated_role_models[role] = None
+                        cleaned_fields.append(f"role_default_models[{role}]")
+                        needs_update = True
+                    else:
+                        updated_role_models[role] = model_id
+                
+                if needs_update:
+                    self._default_models.role_default_models = updated_role_models  # type: ignore[attr-defined]
             
             # Update database if any fields were cleaned
             if needs_update:

@@ -132,13 +132,19 @@ async def save_source(state: SourceState) -> dict:
             
             if pageindex_service.is_available() and source.full_text:
                 logger.info(f"Building PageIndex for source {source.id}...")
-                # 異步建立索引（不阻塞主流程）
-                # 使用 create_task 讓索引建立與主流程並行
-                import asyncio
-                asyncio.create_task(
-                    pageindex_service._get_or_create_index_for_source(source.id, source)
-                )
-                logger.info(f"PageIndex building task started for source {source.id}")
+                try:
+                    # 同步建立索引（確保狀態更新）
+                    await pageindex_service._get_or_create_index_for_source(source.id, source)
+                    logger.info(f"Successfully built PageIndex for source {source.id}")
+                except Exception as pageindex_error:
+                    # 捕獲 PageIndex 建構錯誤，但不影響主流程
+                    logger.warning(
+                        f"PageIndex build failed for source {source.id} "
+                        f"(likely unstructured text or too short). "
+                        f"Fallback to Vector Search only. Error: {pageindex_error}"
+                    )
+                    # Source 的 pageindex_structure 保持為 None，表示不支援 PageIndex
+                    # 這已經足夠標記該 Source 為「僅支援向量搜尋」
             elif not pageindex_service.is_available():
                 logger.warning(f"PageIndex not available, skipping index building for source {source.id}")
             elif not source.full_text:

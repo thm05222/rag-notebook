@@ -21,7 +21,7 @@ async def provision_langchain_model(
     Args:
         content: Input content (for logging purposes only, no longer used for token-based model selection)
         model_id: Specified model ID. If None, will be retrieved from role default configuration.
-        role: Role name (orchestrator, executor, refiner, etc.) - used to look up default model type from config
+        default_type: Role name (orchestrator, executor, refiner, etc.) - used to look up default model type from config
         **kwargs: Additional model parameters
     
     Returns:
@@ -30,27 +30,43 @@ async def provision_langchain_model(
     Raises:
         ValueError: If model is not configured for the specified role
     """
-    # If model_id is not specified, get default model type from role configuration
+    # If model_id is not specified, get default model from role-specific configuration
     if model_id is None:
         defaults = await model_manager.get_defaults()
-        role_types = defaults.role_default_types or {}
-        default_type = role_types.get(role)
         
-        if default_type:
-            model_id = getattr(defaults, f"default_{default_type}_model", None)
+        # Check role-specific model configuration (required, no fallback)
+        role_models = defaults.role_default_models or {}
+        logger.debug(f"Looking up model for role '{default_type}', available role_models: {role_models}")
+        direct_model_id = role_models.get(default_type)
         
-        if not model_id:
-            raise ValueError(
-                f"Model not configured for role '{role}'. "
-                f"Please configure a model in Settings > Models."
-            )
+        if not direct_model_id:
+            # Check all required roles and return list of missing ones
+            required_roles = ["orchestrator", "executor", "refiner"]
+            missing_roles = [
+                role for role in required_roles 
+                if not role_models.get(role)
+            ]
+            
+            if missing_roles:
+                raise ValueError(
+                    f"Missing required role models: {', '.join(missing_roles)}. "
+                    f"Please configure these models in Settings > Models."
+                )
+            else:
+                # This shouldn't happen, but handle gracefully
+                raise ValueError(
+                    f"Model not configured for role '{default_type}'. "
+                    f"Please configure this model in Settings > Models."
+                )
+        
+        model_id = direct_model_id
     
     # Get model directly, no automatic selection logic
     model = await model_manager.get_model(model_id, **kwargs)
     
     if model is None:
         raise ValueError(
-            f"Model with ID '{model_id}' not found for role '{role}'. "
+            f"Model with ID '{model_id}' not found for role '{default_type}'. "
             f"Please check your model configuration."
         )
     

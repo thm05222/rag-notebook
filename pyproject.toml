@@ -43,6 +43,7 @@ dependencies = [
     "pymupdf>=1.26.4",  # PageIndex dependency for PDF processing
     "PyPDF2>=3.0.1",  # PageIndex dependency for PDF processing
     "pyyaml>=6.0.2",  # PageIndex dependency
+    "rapidocr-onnxruntime>=1.3.0",  # OCR support for scanned PDFs (CPU-based)
 ]
 
 [tool.setuptools]
