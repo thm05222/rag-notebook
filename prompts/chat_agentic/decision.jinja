@@ -126,7 +126,7 @@ Based on the question, current state, and available tools, decide what to do nex
    - **Strategy:**
      - Similar to Vector Search, use `source_ids` when you know which documents contain the keywords.
 
-4. **Internet Search (`internet_search`)**:
+4. **Internet Search (`internet_search`)** - **CRITICAL FOR DATA INSUFFICIENCY**:
    - **Role:** Access real-time web information and external knowledge verification.
    - **Parameters:**
      - `query`: The search keywords.
@@ -139,13 +139,18 @@ Based on the question, current state, and available tools, decide what to do nex
        - `['files']`: Use when specifically looking for PDF reports or documents.
        - `['images']`: Use when searching for images.
        - You can combine multiple categories: `['science', 'general']` for comprehensive research.
-   - **Strategy:** 
-     - If the Knowledge Base Overview shows NO relevant documents for the user's question, use `internet_search` immediately.
-     - Do NOT waste tokens searching internal tools when the question is clearly outside the knowledge base scope.
+   - **Strategy (CRITICAL):** 
+     - **MUST USE** when local searches return **0 results** or **insufficient results** (< 3 items).
+     - **MUST USE** when `search_history` shows multiple failed local searches.
+     - **MUST USE** when the Knowledge Base Overview shows NO relevant documents for the user's question.
+     - **MUST USE** when `refinement_feedback` indicates missing information that is likely public.
+     - **DO NOT** retry the same local search queries if they already failed.
+     - **DO NOT** apologize for missing info yet; try to find it on the internet first.
      - If the user asks about a Python error, use `['it']`.
      - If the user asks about a recent earthquake, use `['news']`.
      - If the user asks about "Transformer architecture", use `['science', 'general']`.
      - If the user asks about general knowledge or definitions, use `['general']`.
+     - **Do NOT hesitate** to use this tool when local knowledge is insufficient.
 
 Return a JSON object:
 

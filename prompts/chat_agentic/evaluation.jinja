@@ -55,6 +55,24 @@ Evaluate based on:
    - Check for claims that go beyond what the expert advice supports
    - Validate that all citations exist in the expert advice
 
+# HANDLING MISSING INFORMATION
+
+**CRITICAL**: If the collected results are insufficient to answer the user's question comprehensively:
+
+1. **Identify specifically what information is missing**:
+   - What aspects of the question are not covered?
+   - What specific facts, data, or context is lacking?
+   - Are the results too few or too irrelevant?
+
+2. **Recommend Internet Search**:
+   - If the missing information is likely **public** (e.g., facts, news, definitions, external references, general knowledge, current events), **explicitly suggest using `internet_search`** in your reasoning/feedback.
+   - In your `reasoning` field, clearly state: "The collected results are insufficient. Missing information about [specific topic]. Recommend using `internet_search` to find this information."
+   - Set `decision` to `"continue"` or `"refine_search"` with explicit suggestion to use `internet_search`.
+
+3. **Do not accept partial answers prematurely**:
+   - If internet search hasn't been attempted yet and the missing information is likely available online, **do not accept** a partial answer.
+   - Set `decision` to `"continue"` with clear guidance to use `internet_search`.
+
 # HALLUCINATION DETECTION REQUIREMENTS
 
 **You MUST detect hallucinations:**
