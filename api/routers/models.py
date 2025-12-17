@@ -119,44 +119,19 @@ async def delete_model(model_id: str):
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
         
-        # Clean up default models references before deleting
-        defaults = await DefaultModels.get_instance()
-        cleaned_fields = []
-        
-        # Check and clean each default model field
-        if defaults.default_chat_model == model_id:  # type: ignore[attr-defined]
-            defaults.default_chat_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_chat_model")
-        
-        if defaults.default_transformation_model == model_id:  # type: ignore[attr-defined]
-            defaults.default_transformation_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_transformation_model")
-        
-        if defaults.large_context_model == model_id:  # type: ignore[attr-defined]
-            defaults.large_context_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("large_context_model")
-        
-        if defaults.default_embedding_model == model_id:  # type: ignore[attr-defined]
-            defaults.default_embedding_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_embedding_model")
-        
-        if defaults.default_tools_model == model_id:  # type: ignore[attr-defined]
-            defaults.default_tools_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_tools_model")
-        
-        # Update defaults if any fields were cleaned
-        if cleaned_fields:
-            await defaults.update()
-            logger.info(
-                f"Cleaned up default model references for deleted model {model_id}: {', '.join(cleaned_fields)}"
-            )
-            
-            # Refresh the model manager cache
-            from open_notebook.domain.models import model_manager
-            await model_manager.refresh_defaults()
-        
-        # Delete the model
+        # Delete the model first
         await model.delete()
+        
+        # Clean up invalid model references (including the deleted model)
+        from open_notebook.domain.models import model_manager
+        cleaned_fields = await model_manager.clean_invalid_model_references(auto_save=True)
+        
+        if cleaned_fields:
+            logger.info(
+                f"Cleaned up {len(cleaned_fields)} invalid model reference(s) after deleting model {model_id}: {', '.join(cleaned_fields)}"
+            )
+            # Refresh the model manager cache
+            await model_manager.refresh_defaults()
         
         return {"message": "Model deleted successfully"}
     except HTTPException:
@@ -170,63 +145,19 @@ async def delete_model(model_id: str):
 async def get_default_models():
     """Get default model assignments. Automatically cleans up invalid model references."""
     try:
+        from open_notebook.domain.models import model_manager
+        
+        # Refresh defaults (read-only, no side effects)
+        await model_manager.refresh_defaults()
         defaults = await DefaultModels.get_instance()
         
-        # Automatically clean up invalid model references
-        all_models = await Model.get_all()
-        valid_model_ids = {model.id for model in all_models if model.id}
-        needs_update = False
+        # Clean up invalid model references using the dedicated method
+        cleaned_fields = await model_manager.clean_invalid_model_references(auto_save=True)
         
-        # Check and clean each default model field
-        if defaults.default_chat_model and defaults.default_chat_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_chat_model reference: {defaults.default_chat_model}")  # type: ignore[attr-defined]
-            defaults.default_chat_model = None  # type: ignore[attr-defined]
-            needs_update = True
-        
-        if defaults.default_transformation_model and defaults.default_transformation_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_transformation_model reference: {defaults.default_transformation_model}")  # type: ignore[attr-defined]
-            defaults.default_transformation_model = None  # type: ignore[attr-defined]
-            needs_update = True
-        
-        if defaults.large_context_model and defaults.large_context_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid large_context_model reference: {defaults.large_context_model}")  # type: ignore[attr-defined]
-            defaults.large_context_model = None  # type: ignore[attr-defined]
-            needs_update = True
-        
-        if defaults.default_embedding_model and defaults.default_embedding_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_embedding_model reference: {defaults.default_embedding_model}")  # type: ignore[attr-defined]
-            defaults.default_embedding_model = None  # type: ignore[attr-defined]
-            needs_update = True
-        
-        if defaults.default_tools_model and defaults.default_tools_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_tools_model reference: {defaults.default_tools_model}")  # type: ignore[attr-defined]
-            defaults.default_tools_model = None  # type: ignore[attr-defined]
-            needs_update = True
-        
-        # Check and clean role_default_models for invalid references
-        role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
-        cleaned_role_models = False
-        if role_models:
-            updated_role_models = {}
-            for role, model_id in role_models.items():
-                if model_id and model_id not in valid_model_ids:
-                    logger.warning(f"Cleaning up invalid role_default_models[{role}] reference: {model_id}")
-                    updated_role_models[role] = None
-                    cleaned_role_models = True
-                else:
-                    updated_role_models[role] = model_id
-            
-            if cleaned_role_models:
-                defaults.role_default_models = updated_role_models  # type: ignore[attr-defined]
-                needs_update = True
-        
-        # Update defaults if any fields were cleaned
-        if needs_update:
-            await defaults.update()
-            logger.info("Automatically cleaned up invalid model references")
-            # Refresh the model manager cache
-            from open_notebook.domain.models import model_manager
+        if cleaned_fields:
+            # Refresh again to get the cleaned configuration
             await model_manager.refresh_defaults()
+            defaults = await DefaultModels.get_instance()
 
         return DefaultModelsResponse(
             default_chat_model=defaults.default_chat_model,  # type: ignore[attr-defined]
@@ -245,66 +176,22 @@ async def get_default_models():
 async def update_default_models(defaults_data: DefaultModelsResponse):
     """Update default model assignments. Automatically cleans up invalid references before updating."""
     try:
+        from open_notebook.domain.models import model_manager
+        
         defaults = await DefaultModels.get_instance()
         
         # First, clean up all invalid model references before updating
         # This ensures we don't leave invalid references even if user only updates some fields
-        all_models = await Model.get_all()
-        valid_model_ids = {model.id for model in all_models if model.id}
-        cleaned_fields = []
-        needs_update = False
-        
-        # Check and clean each default model field for invalid references
-        if defaults.default_chat_model and defaults.default_chat_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_chat_model reference: {defaults.default_chat_model}")  # type: ignore[attr-defined]
-            defaults.default_chat_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_chat_model")
-            needs_update = True
-        
-        if defaults.default_transformation_model and defaults.default_transformation_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_transformation_model reference: {defaults.default_transformation_model}")  # type: ignore[attr-defined]
-            defaults.default_transformation_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_transformation_model")
-            needs_update = True
-        
-        if defaults.large_context_model and defaults.large_context_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid large_context_model reference: {defaults.large_context_model}")  # type: ignore[attr-defined]
-            defaults.large_context_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("large_context_model")
-            needs_update = True
-        
-        if defaults.default_embedding_model and defaults.default_embedding_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_embedding_model reference: {defaults.default_embedding_model}")  # type: ignore[attr-defined]
-            defaults.default_embedding_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_embedding_model")
-            needs_update = True
-        
-        if defaults.default_tools_model and defaults.default_tools_model not in valid_model_ids:  # type: ignore[attr-defined]
-            logger.warning(f"Cleaning up invalid default_tools_model reference: {defaults.default_tools_model}")  # type: ignore[attr-defined]
-            defaults.default_tools_model = None  # type: ignore[attr-defined]
-            cleaned_fields.append("default_tools_model")
-            needs_update = True
-        
-        # Check and clean role_default_models for invalid references
-        role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
-        cleaned_role_models = False
-        if role_models:
-            updated_role_models = {}
-            for role, model_id in role_models.items():
-                if model_id and model_id not in valid_model_ids:
-                    logger.warning(f"Cleaning up invalid role_default_models[{role}] reference: {model_id}")
-                    updated_role_models[role] = None
-                    cleaned_role_models = True
-                else:
-                    updated_role_models[role] = model_id
-            
-            if cleaned_role_models:
-                defaults.role_default_models = updated_role_models  # type: ignore[attr-defined]
-                cleaned_fields.append("role_default_models")
-                needs_update = True
+        cleaned_fields = await model_manager.clean_invalid_model_references(auto_save=True)
         
         if cleaned_fields:
-            logger.info(f"Cleaned up {len(cleaned_fields)} invalid model reference(s) before update: {', '.join(cleaned_fields)}")
+            # Refresh to get cleaned configuration
+            await model_manager.refresh_defaults()
+            defaults = await DefaultModels.get_instance()
+        
+        # Get valid model IDs for validation
+        all_models = await Model.get_all()
+        valid_model_ids = {model.id for model in all_models if model.id}
         
         # Now update only provided fields (after cleaning invalid references)
         if defaults_data.default_chat_model is not None:
@@ -372,56 +259,24 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
 async def cleanup_invalid_model_references():
     """Clean up invalid model references in default models configuration."""
     try:
-        defaults = await DefaultModels.get_instance()
-        cleaned_fields = []
+        from open_notebook.domain.models import model_manager
         
-        # Get all existing model IDs to validate references
-        all_models = await Model.get_all()
-        valid_model_ids = {model.id for model in all_models if model.id}
+        # Refresh defaults first (read-only)
+        await model_manager.refresh_defaults()
         
-        # Check and clean each default model field
-        field_mappings = [
-            ("default_chat_model", "default_chat_model"),
-            ("default_transformation_model", "default_transformation_model"),
-            ("large_context_model", "large_context_model"),
-            ("default_embedding_model", "default_embedding_model"),
-            ("default_tools_model", "default_tools_model"),
-        ]
+        # Clean up invalid model references using the dedicated method
+        cleaned_fields = await model_manager.clean_invalid_model_references(auto_save=True)
         
-        for attr_name, display_name in field_mappings:
-            model_id = getattr(defaults, attr_name, None)  # type: ignore[attr-defined]
-            if model_id and model_id not in valid_model_ids:
-                setattr(defaults, attr_name, None)  # type: ignore[attr-defined]
-                cleaned_fields.append(f"{display_name} (ID: {model_id})")
-                logger.info(f"Cleaned up invalid model reference: {display_name} = {model_id}")
-        
-        # Check and clean role_default_models
-        role_models = defaults.role_default_models or {}  # type: ignore[attr-defined]
-        if role_models:
-            updated_role_models = {}
-            for role, model_id in role_models.items():
-                if model_id and model_id not in valid_model_ids:
-                    updated_role_models[role] = None
-                    cleaned_fields.append(f"role_default_models[{role}] (ID: {model_id})")
-                    logger.info(f"Cleaned up invalid role model reference: {role} = {model_id}")
-                else:
-                    updated_role_models[role] = model_id
-            
-            if any(role_models.get(role) != updated_role_models.get(role) for role in role_models.keys()):
-                defaults.role_default_models = updated_role_models  # type: ignore[attr-defined]
-        
-        # Update defaults if any fields were cleaned
         if cleaned_fields:
-            await defaults.update()
+            # Refresh again to get the cleaned configuration
+            await model_manager.refresh_defaults()
             logger.info(
                 f"Cleaned up {len(cleaned_fields)} invalid model reference(s): {', '.join(cleaned_fields)}"
             )
-            
-            # Refresh the model manager cache
-            from open_notebook.domain.models import model_manager
-            await model_manager.refresh_defaults()
         else:
             logger.info("No invalid model references found to clean up")
+        
+        defaults = await DefaultModels.get_instance()
         
         return DefaultModelsResponse(
             default_chat_model=defaults.default_chat_model,  # type: ignore[attr-defined]

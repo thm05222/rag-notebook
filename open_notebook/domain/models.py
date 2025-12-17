@@ -159,17 +159,25 @@ class ModelManager:
         self._model_cache.clear()
         logger.info("Model cache cleared")
 
-    async def refresh_defaults(self):
-        """Refresh the default models from the database and clear model cache.
-        Automatically cleans up invalid model references when safe to do so."""
-        self._default_models = await DefaultModels.get_instance()
+    async def clean_invalid_model_references(self, auto_save: bool = True) -> List[str]:
+        """
+        Clean up invalid model references from default models configuration.
         
-        # Try to automatically clean up invalid model references
-        # This will be skipped if we're in a different event loop (e.g., in thread pools)
-        # Cleanup will still happen in:
-        # - GET /api/models/defaults (Settings page)
-        # - PUT /api/models/defaults (updating config)
-        # - DELETE /api/models/{model_id} (deleting model)
+        Args:
+            auto_save: If True, automatically save cleaned configuration to database.
+                      If False, only return the list of cleaned fields without saving.
+        
+        Returns:
+            List of field names that were cleaned (e.g., ["default_chat_model", "role_default_models[orchestrator]"])
+        
+        Note:
+            This method should be called explicitly when needed (e.g., after deleting a model,
+            or when updating default models configuration). It should NOT be called automatically
+            during read operations to avoid side effects.
+        """
+        if not self._default_models:
+            await self.refresh_defaults()
+        
         try:
             all_models = await Model.get_all()
             valid_model_ids = {model.id for model in all_models if model.id}
@@ -178,31 +186,31 @@ class ModelManager:
             
             # Check and clean each default model field for invalid references
             if self._default_models.default_chat_model and self._default_models.default_chat_model not in valid_model_ids:  # type: ignore[attr-defined]
-                logger.warning(f"Auto-cleaning invalid default_chat_model reference: {self._default_models.default_chat_model}")  # type: ignore[attr-defined]
+                logger.warning(f"Cleaning invalid default_chat_model reference: {self._default_models.default_chat_model}")  # type: ignore[attr-defined]
                 self._default_models.default_chat_model = None  # type: ignore[attr-defined]
                 cleaned_fields.append("default_chat_model")
                 needs_update = True
             
             if self._default_models.default_transformation_model and self._default_models.default_transformation_model not in valid_model_ids:  # type: ignore[attr-defined]
-                logger.warning(f"Auto-cleaning invalid default_transformation_model reference: {self._default_models.default_transformation_model}")  # type: ignore[attr-defined]
+                logger.warning(f"Cleaning invalid default_transformation_model reference: {self._default_models.default_transformation_model}")  # type: ignore[attr-defined]
                 self._default_models.default_transformation_model = None  # type: ignore[attr-defined]
                 cleaned_fields.append("default_transformation_model")
                 needs_update = True
             
             if self._default_models.large_context_model and self._default_models.large_context_model not in valid_model_ids:  # type: ignore[attr-defined]
-                logger.warning(f"Auto-cleaning invalid large_context_model reference: {self._default_models.large_context_model}")  # type: ignore[attr-defined]
+                logger.warning(f"Cleaning invalid large_context_model reference: {self._default_models.large_context_model}")  # type: ignore[attr-defined]
                 self._default_models.large_context_model = None  # type: ignore[attr-defined]
                 cleaned_fields.append("large_context_model")
                 needs_update = True
             
             if self._default_models.default_embedding_model and self._default_models.default_embedding_model not in valid_model_ids:  # type: ignore[attr-defined]
-                logger.warning(f"Auto-cleaning invalid default_embedding_model reference: {self._default_models.default_embedding_model}")  # type: ignore[attr-defined]
+                logger.warning(f"Cleaning invalid default_embedding_model reference: {self._default_models.default_embedding_model}")  # type: ignore[attr-defined]
                 self._default_models.default_embedding_model = None  # type: ignore[attr-defined]
                 cleaned_fields.append("default_embedding_model")
                 needs_update = True
             
             if self._default_models.default_tools_model and self._default_models.default_tools_model not in valid_model_ids:  # type: ignore[attr-defined]
-                logger.warning(f"Auto-cleaning invalid default_tools_model reference: {self._default_models.default_tools_model}")  # type: ignore[attr-defined]
+                logger.warning(f"Cleaning invalid default_tools_model reference: {self._default_models.default_tools_model}")  # type: ignore[attr-defined]
                 self._default_models.default_tools_model = None  # type: ignore[attr-defined]
                 cleaned_fields.append("default_tools_model")
                 needs_update = True
@@ -213,7 +221,7 @@ class ModelManager:
                 updated_role_models = {}
                 for role, model_id in role_models.items():
                     if model_id and model_id not in valid_model_ids:
-                        logger.warning(f"Auto-cleaning invalid role_default_models[{role}] reference: {model_id}")
+                        logger.warning(f"Cleaning invalid role_default_models[{role}] reference: {model_id}")
                         updated_role_models[role] = None
                         cleaned_fields.append(f"role_default_models[{role}]")
                         needs_update = True
@@ -223,23 +231,28 @@ class ModelManager:
                 if needs_update:
                     self._default_models.role_default_models = updated_role_models  # type: ignore[attr-defined]
             
-            # Update database if any fields were cleaned
-            if needs_update:
+            # Update database if any fields were cleaned and auto_save is enabled
+            if needs_update and auto_save:
                 await self._default_models.update()
-                logger.info(f"Auto-cleaned {len(cleaned_fields)} invalid model reference(s) during refresh: {', '.join(cleaned_fields)}")
-        except RuntimeError as e:
-            # If we get an event loop error (e.g., "Task got Future attached to a different loop"),
-            # skip cleanup for this call. The cleanup will happen when Settings page is accessed or config is updated.
-            error_msg = str(e).lower()
-            if "loop" in error_msg or "future" in error_msg or "attached to a different" in error_msg:
-                logger.debug(f"Skipping auto-cleanup due to event loop conflict: {e}")
-            else:
-                # Re-raise other RuntimeErrors
-                raise
+                logger.info(f"Cleaned {len(cleaned_fields)} invalid model reference(s): {', '.join(cleaned_fields)}")
+            elif needs_update:
+                logger.info(f"Identified {len(cleaned_fields)} invalid model reference(s) to clean (not saved): {', '.join(cleaned_fields)}")
+            
+            return cleaned_fields
         except Exception as e:
-            # For other exceptions, log and skip cleanup rather than failing
-            # This ensures model usage doesn't fail even if cleanup has issues
-            logger.debug(f"Skipping auto-cleanup due to error: {e}")
+            # For exceptions, log and return empty list rather than failing
+            # This ensures cleanup doesn't break the calling code
+            logger.warning(f"Error during model reference cleanup: {e}")
+            logger.exception(e)
+            return []
+
+    async def refresh_defaults(self):
+        """Refresh the default models from the database and clear model cache.
+        
+        Note: This method only reads from the database and does NOT perform any write operations.
+        To clean invalid model references, call clean_invalid_model_references() explicitly.
+        """
+        self._default_models = await DefaultModels.get_instance()
         
         # Clear the model cache to ensure we use fresh instances with the new defaults
         self.clear_cache()

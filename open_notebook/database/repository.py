@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, TypeVar, Union
 from loguru import logger
 from surrealdb import AsyncSurreal, RecordID  # type: ignore
 
+from open_notebook.exceptions import DatabaseOperationError, NotFoundError
+
 # Import connection pool functions
 from open_notebook.database.connection_pool import (
     db_connection as _db_connection,
@@ -62,12 +64,26 @@ async def repo_query(
         try:
             result = parse_record_ids(await connection.query(query_str, vars))
             if isinstance(result, str):
-                raise RuntimeError(result)
+                # Check if the error message indicates a not found condition
+                error_msg_lower = result.lower()
+                if "not found" in error_msg_lower or "does not exist" in error_msg_lower:
+                    raise NotFoundError(result)
+                raise DatabaseOperationError(result)
             return result
+        except (NotFoundError, DatabaseOperationError):
+            # Re-raise our custom exceptions
+            raise
         except Exception as e:
             logger.error(f"Query: {query_str[:200]} vars: {vars}")
             logger.exception(e)
-            raise
+            # Check error message to determine exception type
+            error_msg = str(e).lower()
+            if "not found" in error_msg or "does not exist" in error_msg:
+                raise NotFoundError(f"Record not found: {str(e)}") from e
+            elif "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
+                raise DatabaseOperationError(f"Database connection error: {str(e)}") from e
+            else:
+                raise DatabaseOperationError(f"Database query failed: {str(e)}") from e
 
 
 async def repo_create(table: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,9 +95,16 @@ async def repo_create(table: str, data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         async with db_connection() as connection:
             return parse_record_ids(await connection.insert(table, data))
+    except (NotFoundError, DatabaseOperationError):
+        # Re-raise our custom exceptions
+        raise
     except Exception as e:
         logger.exception(e)
-        raise RuntimeError("Failed to create record")
+        error_msg = str(e).lower()
+        if "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
+            raise DatabaseOperationError(f"Database connection error while creating record: {str(e)}") from e
+        else:
+            raise DatabaseOperationError(f"Failed to create record: {str(e)}") from e
 
 
 async def repo_relate(
@@ -129,11 +152,23 @@ async def repo_update(
         query = f"UPDATE {record_id} MERGE $data;"
         # logger.debug(f"Update query: {query}")
         result = await repo_query(query, {"data": data})
+        # Check if update returned empty result (record not found)
+        if not result or (isinstance(result, list) and len(result) == 0):
+            raise NotFoundError(f"Record {record_id} not found for update")
         # if isinstance(result, list):
         #     return [_return_data(item) for item in result]
         return parse_record_ids(result)
+    except (NotFoundError, DatabaseOperationError):
+        # Re-raise our custom exceptions
+        raise
     except Exception as e:
-        raise RuntimeError(f"Failed to update record: {str(e)}")
+        error_msg = str(e).lower()
+        if "not found" in error_msg or "does not exist" in error_msg:
+            raise NotFoundError(f"Record not found for update: {str(e)}") from e
+        elif "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
+            raise DatabaseOperationError(f"Database connection error while updating record: {str(e)}") from e
+        else:
+            raise DatabaseOperationError(f"Failed to update record: {str(e)}") from e
 
 
 async def repo_get_news_by_jota_id(jota_id: str) -> Dict[str, Any]:
@@ -142,10 +177,21 @@ async def repo_get_news_by_jota_id(jota_id: str) -> Dict[str, Any]:
             "SELECT * omit embedding FROM news where jota_id=$jota_id",
             {"jota_id": jota_id},
         )
+        if not results or len(results) == 0:
+            raise NotFoundError(f"News record with jota_id {jota_id} not found")
         return parse_record_ids(results)
+    except (NotFoundError, DatabaseOperationError):
+        # Re-raise our custom exceptions
+        raise
     except Exception as e:
         logger.exception(e)
-        raise RuntimeError(f"Failed to fetch record: {str(e)}")
+        error_msg = str(e).lower()
+        if "not found" in error_msg or "does not exist" in error_msg:
+            raise NotFoundError(f"Record not found: {str(e)}") from e
+        elif "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
+            raise DatabaseOperationError(f"Database connection error while fetching record: {str(e)}") from e
+        else:
+            raise DatabaseOperationError(f"Failed to fetch record: {str(e)}") from e
 
 
 async def repo_delete(record_id: Union[str, RecordID]):
@@ -153,10 +199,23 @@ async def repo_delete(record_id: Union[str, RecordID]):
 
     try:
         async with db_connection() as connection:
-            return await connection.delete(ensure_record_id(record_id))
+            result = await connection.delete(ensure_record_id(record_id))
+            # Check if delete returned empty result (record not found)
+            if result is None or (isinstance(result, list) and len(result) == 0):
+                raise NotFoundError(f"Record {record_id} not found for deletion")
+            return result
+    except (NotFoundError, DatabaseOperationError):
+        # Re-raise our custom exceptions
+        raise
     except Exception as e:
         logger.exception(e)
-        raise RuntimeError(f"Failed to delete record: {str(e)}")
+        error_msg = str(e).lower()
+        if "not found" in error_msg or "does not exist" in error_msg:
+            raise NotFoundError(f"Record not found for deletion: {str(e)}") from e
+        elif "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
+            raise DatabaseOperationError(f"Database connection error while deleting record: {str(e)}") from e
+        else:
+            raise DatabaseOperationError(f"Failed to delete record: {str(e)}") from e
 
 
 async def repo_insert(
@@ -166,8 +225,15 @@ async def repo_insert(
     try:
         async with db_connection() as connection:
             return parse_record_ids(await connection.insert(table, data))
+    except (NotFoundError, DatabaseOperationError):
+        # Re-raise our custom exceptions
+        raise
     except Exception as e:
         if ignore_duplicates and "already contains" in str(e):
             return []
         logger.exception(e)
-        raise RuntimeError("Failed to create record")
+        error_msg = str(e).lower()
+        if "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
+            raise DatabaseOperationError(f"Database connection error while inserting record: {str(e)}") from e
+        else:
+            raise DatabaseOperationError(f"Failed to create record: {str(e)}") from e
