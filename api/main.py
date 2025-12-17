@@ -213,13 +213,34 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to start orphaned insights cleanup task: {e}")
 
     # Initialize AsyncSqliteSaver checkpointer for chat graph
+    # Use standard LangGraph approach: create aiosqlite connection in lifespan
+    db_connection = None
     try:
+        import aiosqlite
+        import os
         from open_notebook.graphs.chat import initialize_checkpointer
-        await initialize_checkpointer()
+        from open_notebook.config import LANGGRAPH_CHECKPOINT_FILE
+        
+        # Ensure directory exists
+        checkpoint_path = os.path.abspath(LANGGRAPH_CHECKPOINT_FILE)
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        
+        # Create aiosqlite connection
+        db_connection = await aiosqlite.connect(checkpoint_path)
+        
+        # Initialize checkpointer with the connection
+        await initialize_checkpointer(db_connection)
         logger.success("Chat graph checkpointer initialized successfully")
     except Exception as e:
         logger.warning(f"Failed to initialize chat graph checkpointer: {e}")
         logger.warning("Chat functionality may not work properly")
+        # Close connection if initialization failed
+        if db_connection:
+            try:
+                await db_connection.close()
+            except Exception:
+                pass
+            db_connection = None
 
     logger.success("API initialization completed successfully")
 
@@ -237,8 +258,10 @@ async def lifespan(app: FastAPI):
     # Cleanup chat graph checkpointer
     try:
         from open_notebook.graphs.chat import cleanup_checkpointer
-        await cleanup_checkpointer()
-        logger.info("Chat graph checkpointer cleaned up")
+        # db_connection is captured from the startup scope (before yield)
+        if db_connection:
+            await cleanup_checkpointer(db_connection)
+            logger.info("Chat graph checkpointer cleaned up")
     except Exception as e:
         logger.warning(f"Error cleaning up chat graph checkpointer: {e}")
     

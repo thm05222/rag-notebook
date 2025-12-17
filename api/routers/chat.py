@@ -750,6 +750,30 @@ async def stream_chat_response(
     start_time = time.time()
     final_answer = None
     
+    # 關鍵：在調用 graph.astream_events 之前，強制清空所有 operator.add 字段
+    # 因為 operator.add 的行為是 舊列表 + 新列表，返回 [] 不會清空舊狀態
+    # 必須使用 aupdate_state 強制覆蓋
+    try:
+        thread_id = config_dict.get("configurable", {}).get("thread_id")
+        if thread_id:
+            logger.info(f"Pre-invoke state clear: Clearing all operator.add fields for thread_id={thread_id}")
+            await chat_graph.aupdate_state(
+                config=RunnableConfig(configurable={"thread_id": thread_id}),
+                values={
+                    "search_history": [],
+                    "collected_results": [],
+                    "current_tool_calls": [],
+                    "reasoning_trace": [],
+                    "decision_history": [],
+                    "error_history": [],
+                    "unavailable_tools": [],  # 新增
+                }
+            )
+            logger.info("Pre-invoke state clear: Successfully cleared all operator.add fields")
+    except Exception as clear_error:
+        logger.warning(f"Pre-invoke state clear failed: {clear_error}")
+        # 不中斷執行，繼續進行
+    
     try:
         async for event in chat_graph.astream_events(
             input=graph_input,
@@ -1216,6 +1240,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": len(state_values.get("search_history", [])),
                             "current_tool_calls": len(state_values.get("current_tool_calls", [])),
                             "error_history": len(state_values.get("error_history", [])),
+                            "unavailable_tools": len(state_values.get("unavailable_tools", [])),
                         }
                         logger.info(f"Timeout recovery: Before clearing - accumulated fields counts: {before_counts}")
                         
@@ -1225,6 +1250,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": [],
                             "current_tool_calls": [],
                             "error_history": [],
+                            "unavailable_tools": [],  # 新增
                         }
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
@@ -1243,6 +1269,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": len(state_after.get("search_history", [])),
                             "current_tool_calls": len(state_after.get("current_tool_calls", [])),
                             "error_history": len(state_after.get("error_history", [])),
+                            "unavailable_tools": len(state_after.get("unavailable_tools", [])),
                         }
                         logger.info(f"Timeout recovery: After clearing - accumulated fields counts: {after_counts}")
                         
@@ -1382,6 +1409,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": len(state_values.get("search_history", [])),
                             "current_tool_calls": len(state_values.get("current_tool_calls", [])),
                             "error_history": len(state_values.get("error_history", [])),
+                            "unavailable_tools": len(state_values.get("unavailable_tools", [])),
                         }
                         logger.info(f"Recursion limit fallback: Before clearing - accumulated fields counts: {before_counts}")
                         
@@ -1391,6 +1419,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": [],
                             "current_tool_calls": [],
                             "error_history": [],
+                            "unavailable_tools": [],  # 新增
                         }
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
@@ -1409,6 +1438,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": len(state_after.get("search_history", [])),
                             "current_tool_calls": len(state_after.get("current_tool_calls", [])),
                             "error_history": len(state_after.get("error_history", [])),
+                            "unavailable_tools": len(state_after.get("unavailable_tools", [])),
                         }
                         logger.info(f"Recursion limit fallback: After clearing - accumulated fields counts: {after_counts}")
                         
@@ -1518,6 +1548,7 @@ async def execute_chat(request: ExecuteChatRequest):
                 "search_history": len(state_before.get("search_history", [])),
                 "current_tool_calls": len(state_before.get("current_tool_calls", [])),
                 "error_history": len(state_before.get("error_history", [])),
+                "unavailable_tools": len(state_before.get("unavailable_tools", [])),
             }
             logger.info(f"Before clearing - accumulated fields counts: {before_counts}")
             
@@ -1529,6 +1560,7 @@ async def execute_chat(request: ExecuteChatRequest):
                 "search_history": [],
                 "current_tool_calls": [],
                 "error_history": [],
+                "unavailable_tools": [],  # 新增
             }
             await chat_graph.aupdate_state(
                 config=RunnableConfig(configurable={"thread_id": thread_id}),
@@ -1547,6 +1579,7 @@ async def execute_chat(request: ExecuteChatRequest):
                 "search_history": len(state_after.get("search_history", [])),
                 "current_tool_calls": len(state_after.get("current_tool_calls", [])),
                 "error_history": len(state_after.get("error_history", [])),
+                "unavailable_tools": len(state_after.get("unavailable_tools", [])),
             }
             logger.info(f"After clearing - accumulated fields counts: {after_counts}")
             
@@ -1774,6 +1807,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": len(state_values.get("search_history", [])),
                             "current_tool_calls": len(state_values.get("current_tool_calls", [])),
                             "error_history": len(state_values.get("error_history", [])),
+                            "unavailable_tools": len(state_values.get("unavailable_tools", [])),
                         }
                         logger.info(f"Connection error recovery: Before clearing - accumulated fields counts: {before_counts}")
                         
@@ -1783,6 +1817,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": [],
                             "current_tool_calls": [],
                             "error_history": [],
+                            "unavailable_tools": [],  # 新增
                         }
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
@@ -1801,6 +1836,7 @@ async def execute_chat(request: ExecuteChatRequest):
                             "search_history": len(state_after.get("search_history", [])),
                             "current_tool_calls": len(state_after.get("current_tool_calls", [])),
                             "error_history": len(state_after.get("error_history", [])),
+                            "unavailable_tools": len(state_after.get("unavailable_tools", [])),
                         }
                         logger.info(f"Connection error recovery: After clearing - accumulated fields counts: {after_counts}")
                         

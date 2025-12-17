@@ -277,6 +277,7 @@ async def initialize_chat_state(
         "max_duration": max_duration,
         "decision_history": [],  # 關鍵修復：強制重置，避免舊狀態影響
         "error_history": [],  # 強制重置
+        "unavailable_tools": [],  # 類型一致性（不會物理清空，因為 operator.add 的行為是 舊列表 + [] = 舊列表）
         "model_override": state.get("model_override"),
         "current_decision": None,  # 關鍵修復：強制重置當前決策為 None
         "refinement_feedback": None,  # 強制重置 feedback
@@ -2475,172 +2476,9 @@ async def synthesize_answer_node(
 
 
 # Create async SQLite checkpointer
-# AsyncSqliteSaver.from_conn_string() returns a context manager
-# We need a persistent checkpointer. Let's create a wrapper that manages the context properly.
+# Use standard LangGraph approach: create aiosqlite connection in lifespan and pass to AsyncSqliteSaver
 
-checkpoint_path = os.path.abspath(LANGGRAPH_CHECKPOINT_FILE)
-_checkpointer_conn_string = f"sqlite:///{checkpoint_path}"
-
-
-class PersistentAsyncSqliteSaver:
-    """
-    Wrapper for AsyncSqliteSaver that maintains the context manager alive.
-
-    使用 aiosqlite 連接直接創建 AsyncSqliteSaver，而不是使用 from_conn_string() 的 context manager。
-    """
-
-    def __init__(self, conn_string: str):
-        self.conn_string = conn_string
-        self._checkpointer = None
-        self._connection = None
-        self._context_manager = None
-        self._initialized = False
-
-    async def initialize(self):
-        """Initialize the checkpointer using aiosqlite connection."""
-        if not self._initialized:
-            try:
-                # 從連接字符串中提取文件路徑
-                if self.conn_string.startswith("sqlite:///"):
-                    file_path = self.conn_string.replace("sqlite:///", "")
-                else:
-                    file_path = self.conn_string
-
-                # 方法 1: 嘗試使用 aiosqlite 連接直接創建 AsyncSqliteSaver
-                # 先創建連接但不立即使用
-                self._connection = await aiosqlite.connect(file_path)
-
-                # 嘗試直接實例化（檢查 AsyncSqliteSaver 是否接受連接對象作為參數）
-                direct_creation_failed = False
-                try:
-                    # 測試 AsyncSqliteSaver 是否接受連接對象
-                    test_checkpointer = AsyncSqliteSaver(self._connection)
-                    # 如果成功，驗證它是否有必要的方法
-                    if hasattr(test_checkpointer, "aget_tuple"):
-                        self._checkpointer = test_checkpointer
-                        logger.info(
-                            "AsyncSqliteSaver created directly with aiosqlite connection"
-                        )
-                    else:
-                        direct_creation_failed = True
-                except (TypeError, AttributeError, Exception) as e:
-                    logger.debug(
-                        f"Direct creation failed: {e}, trying context manager method"
-                    )
-                    direct_creation_failed = True
-
-                # 方法 2: 如果直接創建失敗，使用 from_conn_string
-                if direct_creation_failed:
-                    # 關閉之前創建的連接，因為 from_conn_string 會自己管理連接
-                    if self._connection:
-                        await self._connection.close()
-                        self._connection = None
-
-                    logger.info("Using from_conn_string method with context manager...")
-                    cm = AsyncSqliteSaver.from_conn_string(self.conn_string)
-
-                    # 進入 context manager 獲取實際的 checkpointer
-                    # 注意：這裡需要確保返回的是實際的 AsyncSqliteSaver 實例
-                    checkpointer = await cm.__aenter__()
-
-                    # 驗證返回的對象類型 - 確保不是 context manager
-                    checkpointer_type = type(checkpointer).__name__
-                    logger.info(
-                        f"Context manager __aenter__ returned type: {checkpointer_type}"
-                    )
-
-                    # 檢查是否仍然是 context manager（這表示 __aenter__ 返回了錯誤的對象）
-                    if (
-                        "ContextManager" in checkpointer_type
-                        or "Generator" in checkpointer_type
-                    ):
-                        raise RuntimeError(
-                            f"Context manager __aenter__ returned another context manager! "
-                            f"Type: {checkpointer_type}. "
-                            f"This suggests AsyncSqliteSaver.from_conn_string() usage is incorrect."
-                        )
-
-                    # 驗證返回的對象有必要的 checkpointer 方法
-                    if not hasattr(checkpointer, "aget_tuple"):
-                        available_methods = [
-                            m for m in dir(checkpointer) if not m.startswith("_")
-                        ][:15]
-                        raise RuntimeError(
-                            f"Object returned from context manager is not a valid checkpointer. "
-                            f"Type: {checkpointer_type}, "
-                            f"has aget_tuple: {hasattr(checkpointer, 'aget_tuple')}, "
-                            f"Available methods: {available_methods}"
-                        )
-
-                    self._checkpointer = checkpointer
-                    # 保存 context manager 以便後續清理
-                    self._context_manager = cm
-                    logger.info(
-                        f"AsyncSqliteSaver initialized from context manager. Type: {checkpointer_type}"
-                    )
-
-                # 最終驗證：確保 checkpointer 有所有必要的方法
-                required_methods = ["aget_tuple", "aput", "aget", "alist"]
-                missing_methods = [
-                    m for m in required_methods if not hasattr(self._checkpointer, m)
-                ]
-                if missing_methods:
-                    available_methods = [
-                        m for m in dir(self._checkpointer) if not m.startswith("_")
-                    ][:15]
-                    raise RuntimeError(
-                        f"Checkpointer missing required methods: {missing_methods}. "
-                        f"Type: {type(self._checkpointer).__name__}, "
-                        f"Available methods: {available_methods}"
-                    )
-
-                self._initialized = True
-                logger.info(
-                    f"PersistentAsyncSqliteSaver initialized successfully. "
-                    f"Type: {type(self._checkpointer).__name__}, "
-                    f"Has aget_tuple: {hasattr(self._checkpointer, 'aget_tuple')}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize checkpointer: {e}")
-                logger.exception(e)
-                raise
-        return self._checkpointer
-
-    async def cleanup(self):
-        """Clean up the checkpointer."""
-        if self._initialized:
-            try:
-                # 如果有 context manager，退出它
-                if hasattr(self, "_context_manager") and self._context_manager:
-                    await self._context_manager.__aexit__(None, None, None)
-
-                # 關閉 aiosqlite 連接
-                if self._connection:
-                    await self._connection.close()
-
-                logger.info("PersistentAsyncSqliteSaver cleaned up")
-            except Exception as e:
-                logger.warning(f"Error cleaning up checkpointer: {e}")
-            finally:
-                self._initialized = False
-                self._checkpointer = None
-                self._connection = None
-                if hasattr(self, "_context_manager"):
-                    self._context_manager = None
-
-    @property
-    def checkpointer(self):
-        """Get the checkpointer instance."""
-        if not self._initialized:
-            raise RuntimeError("Checkpointer not initialized. Call initialize() first.")
-        return self._checkpointer
-
-
-# Global checkpointer wrapper - will be initialized in api/main.py lifespan
-_checkpointer_wrapper = PersistentAsyncSqliteSaver(_checkpointer_conn_string)
-memory: Optional[AsyncSqliteSaver] = (
-    None  # Will be set to the actual checkpointer after initialization
-)
+memory: Optional[AsyncSqliteSaver] = None  # Will be set to the actual checkpointer after initialization
 
 # Build the graph structure first
 agent_state = StateGraph(ChatAgenticState)
@@ -2729,19 +2567,25 @@ agent_state.add_conditional_edges(
 _graph_instance = None
 
 
-async def initialize_checkpointer():
-    """Initialize the async checkpointer. Should be called in application lifespan."""
+async def initialize_checkpointer(connection: aiosqlite.Connection):
+    """Initialize the async checkpointer using an existing connection.
+    
+    Args:
+        connection: An aiosqlite.Connection instance that will be managed by the application lifespan.
+    
+    Returns:
+        The initialized AsyncSqliteSaver checkpointer instance.
+    """
     global memory, graph, _graph_instance
     if memory is None:
-        # 初始化 wrapper 的 checkpointer
-        await _checkpointer_wrapper.initialize()
-        memory = _checkpointer_wrapper.checkpointer
-
-        # 驗證 checkpointer 類型和方法
+        # Create AsyncSqliteSaver directly with the provided connection
+        memory = AsyncSqliteSaver(connection)
+        
+        # Verify checkpointer type and methods
         checkpointer_type = type(memory).__name__
         logger.info(f"Checkpointer type: {checkpointer_type}")
 
-        # 驗證必要的方法存在
+        # Verify required methods exist
         required_methods = ["aget_tuple", "aput", "aget", "alist"]
         missing_methods = [m for m in required_methods if not hasattr(memory, m)]
         if missing_methods:
@@ -2752,9 +2596,9 @@ async def initialize_checkpointer():
 
         logger.info("AsyncSqliteSaver checkpointer initialized and validated")
 
-        # 編譯 graph 並傳遞 checkpointer
+        # Compile graph with checkpointer
         try:
-            # 嘗試在編譯時設置 recursion_limit（如果支持）
+            # Try to set recursion_limit during compilation if supported
             try:
                 _graph_instance = agent_state.compile(
                     checkpointer=memory,
@@ -2778,9 +2622,15 @@ async def initialize_checkpointer():
     return memory
 
 
-async def cleanup_checkpointer():
-    """Clean up the checkpointer. Should be called in application shutdown."""
-    await _checkpointer_wrapper.cleanup()
+async def cleanup_checkpointer(connection: aiosqlite.Connection):
+    """Close the shared database connection.
+    
+    Args:
+        connection: The aiosqlite.Connection instance to close.
+    """
+    if connection:
+        await connection.close()
+        logger.info("Checkpointer connection closed")
 
 
 def get_graph():
@@ -2788,14 +2638,10 @@ def get_graph():
     global _graph_instance, memory
     if _graph_instance is None:
         if memory is None:
-            # Try to get checkpointer from wrapper if it's initialized
-            if _checkpointer_wrapper._initialized:
-                memory = _checkpointer_wrapper.checkpointer
-            else:
-                raise RuntimeError(
-                    "Checkpointer not initialized. Call initialize_checkpointer() first. "
-                    "This usually happens in application lifespan startup."
-                )
+            raise RuntimeError(
+                "Checkpointer not initialized. Call initialize_checkpointer() first. "
+                "This usually happens in application lifespan startup."
+            )
         _graph_instance = agent_state.compile(checkpointer=memory)
     return _graph_instance
 
