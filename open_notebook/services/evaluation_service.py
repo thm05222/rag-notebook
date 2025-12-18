@@ -199,7 +199,12 @@ class EvaluationService:
         )
         
         stage1_response = await stage1_model.ainvoke(stage1_prompt_text)
-        stage1_content = stage1_response.content if isinstance(stage1_response.content, str) else str(stage1_response.content)
+        # 防禦性檢查：處理 response 可能是 dict 或對象的情況
+        if isinstance(stage1_response, dict):
+            stage1_content = stage1_response.get("content", str(stage1_response))
+        else:
+            stage1_content = stage1_response.content if hasattr(stage1_response, "content") else str(stage1_response)
+        stage1_content = stage1_content if isinstance(stage1_content, str) else str(stage1_content)
         evaluation_text = clean_thinking_content(stage1_content)
         
         logger.debug(f"Stage 1 evaluation text length: {len(evaluation_text)}")
@@ -229,7 +234,12 @@ class EvaluationService:
         )
         
         stage2_response = await stage2_model.ainvoke(stage2_prompt_text)
-        stage2_content = stage2_response.content if isinstance(stage2_response.content, str) else str(stage2_response.content)
+        # 防禦性檢查：處理 response 可能是 dict 或對象的情況
+        if isinstance(stage2_response, dict):
+            stage2_content = stage2_response.get("content", str(stage2_response))
+        else:
+            stage2_content = stage2_response.content if hasattr(stage2_response, "content") else str(stage2_response)
+        stage2_content = stage2_content if isinstance(stage2_content, str) else str(stage2_content)
         cleaned_content = clean_thinking_content(stage2_content)
         
         # 解析為 Pydantic 模型
@@ -312,7 +322,12 @@ class EvaluationService:
             )
             
             response = await model.ainvoke(system_prompt)
-            content = response.content if isinstance(response.content, str) else str(response.content)
+            # 防禦性檢查：處理 response 可能是 dict 或對象的情況
+            if isinstance(response, dict):
+                content = response.get("content", str(response))
+            else:
+                content = response.content if hasattr(response, "content") else str(response)
+            content = content if isinstance(content, str) else str(content)
             cleaned_content = clean_thinking_content(content)
             
             # Parse evaluation from response

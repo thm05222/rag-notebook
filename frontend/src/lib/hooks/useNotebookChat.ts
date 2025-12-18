@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { chatApi } from '@/lib/api/chat'
@@ -21,6 +21,25 @@ interface UseNotebookChatParams {
   contextSelections: ContextSelections
 }
 
+// 輔助函數：合併消息列表並去重
+const mergeMessages = (local: NotebookChatMessage[], remote: NotebookChatMessage[]): NotebookChatMessage[] => {
+  const messageMap = new Map<string, NotebookChatMessage>();
+  
+  // 先放原本的（保留前端可能的臨時狀態）
+  local.forEach(m => {
+    const key = m.id || `${m.type}-${m.content?.substring(0, 50)}`; // 優先用 ID，沒有 ID 用內容當 Key
+    messageMap.set(key, m);
+  });
+  
+  // 再放後端的（以服務器為準，但要確保不覆蓋正在生成的流）
+  remote.forEach(m => {
+    const key = m.id || `${m.type}-${m.content?.substring(0, 50)}`;
+    messageMap.set(key, m);
+  });
+  
+  return Array.from(messageMap.values());
+};
+
 export function useNotebookChat({ notebookId, sources, contextSelections }: UseNotebookChatParams) {
   const queryClient = useQueryClient()
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
@@ -30,6 +49,10 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
   const [charCount, setCharCount] = useState<number>(0)
   const [thinkingSteps, setThinkingSteps] = useState<AgentThinkingStep[]>([])
   const [isThinking, setIsThinking] = useState(false)
+  const [isSwitchingSession, setIsSwitchingSession] = useState(false)
+  
+  // 使用 useRef 追蹤上一次的 sessionId，避免不必要的清空
+  const prevSessionIdRef = useRef<string | null>(null)
 
   // Fetch sessions for this notebook
   const {
@@ -45,7 +68,9 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
   // Fetch current session with messages
   const {
     data: currentSession,
-    refetch: refetchCurrentSession
+    refetch: refetchCurrentSession,
+    isLoading: isSessionLoading,
+    isFetching: isSessionFetching
   } = useQuery({
     queryKey: QUERY_KEYS.notebookChatSession(currentSessionId!),
     queryFn: () => chatApi.getSession(currentSessionId!),
@@ -54,10 +79,59 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
 
   // Update messages when current session changes
   useEffect(() => {
-    if (currentSession?.messages) {
-      setMessages(currentSession.messages)
+    // 1. 如果正在流式傳輸中 (Sending)，絕對不要用後端數據覆蓋前端，也不要清空消息
+    // 這是最高優先級的檢查，必須放在最前面
+    if (isSending) {
+      return
     }
-  }, [currentSession])
+
+    // 2. 檢查 session ID 是否真的改變了
+    // 但只在非流式傳輸時才清空，避免清空正在生成的流
+    const sessionIdChanged = prevSessionIdRef.current !== currentSessionId
+    if (sessionIdChanged) {
+      prevSessionIdRef.current = currentSessionId
+      // Session ID 改變時，立即清空消息（switchSession 已經做了，這裡是雙重保險）
+      // 但只在非流式傳輸時清空
+      if (messages.length > 0) {
+        setMessages([])
+      }
+    }
+
+    // 3. 如果 currentSession 尚未加載，或者 ID 不匹配（舊數據殘留），等待
+    if (!currentSession || (currentSessionId && currentSession.id !== currentSessionId)) {
+      return
+    }
+
+    // 4. 數據同步核心邏輯：只要後端有數據，且 ID 對得上，就更新
+    if (currentSession.messages && currentSession.messages.length > 0) {
+      setMessages((prev) => {
+        const backendMsgs = currentSession.messages || []
+        
+        // 性能優化：如果長度與內容都一樣，就不觸發 re-render
+        if (prev.length === backendMsgs.length) {
+          const lastPrev = prev[prev.length - 1]
+          const lastBackend = backendMsgs[backendMsgs.length - 1]
+          if (lastPrev?.id === lastBackend?.id && lastPrev?.content === lastBackend?.content) {
+            return prev
+          }
+        }
+        
+        // 否則更新為後端數據
+        return backendMsgs
+      })
+    } else if (currentSession && (!currentSession.messages || currentSession.messages.length === 0)) {
+      // 處理後端返回空陣列的情況（例如新對話或已清空的會話）
+      // 但只在非流式傳輸時清空，避免清空正在生成的流
+      if (messages.length > 0) {
+        setMessages([])
+      }
+    }
+
+    // 清除切換狀態
+    if (!isSessionLoading && !isSessionFetching) {
+      setIsSwitchingSession(false)
+    }
+  }, [currentSession, currentSessionId, isSending, isSessionLoading, isSessionFetching])
 
   // Auto-select most recent session when sessions are loaded
   useEffect(() => {
@@ -290,7 +364,7 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
               } else if (data.type === 'complete') {
                 // Stop thinking indicator
                 setIsThinking(false)
-                // If session was auto-created, update currentSessionId
+                // If session was auto-created, update currentSessionId and immediately fetch session data
                 if (data.session_id && data.session_id !== sessionId) {
                   console.log(`Session auto-created: ${sessionId} -> ${data.session_id}`)
                   setCurrentSessionId(data.session_id)
@@ -298,6 +372,25 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
                   queryClient.invalidateQueries({
                     queryKey: QUERY_KEYS.notebookChatSessions(notebookId)
                   })
+                  // Immediately fetch the new session data using the new sessionId
+                  // This ensures the conversation history is properly saved and displayed
+                  try {
+                    const newSessionData = await chatApi.getSession(data.session_id)
+                    // Update the query cache with the new session data
+                    queryClient.setQueryData(
+                      QUERY_KEYS.notebookChatSession(data.session_id),
+                      newSessionData
+                    )
+                    // 使用合併策略，而不是完全替換
+                    if (newSessionData.messages) {
+                      setMessages(prev => {
+                        // 使用 mergeMessages 函數合併消息
+                        return mergeMessages(prev, newSessionData.messages)
+                      })
+                    }
+                  } catch (error) {
+                    console.error('Failed to fetch new session data:', error)
+                  }
                 }
                 // Final thinking process will be loaded via refetchCurrentSession
               }
@@ -313,8 +406,25 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
       setIsSending(false)
       setIsThinking(false)
 
-      // Refetch current session to get updated data
-      await refetchCurrentSession()
+      // 延遲 refetch，確保後端已保存消息
+      setTimeout(async () => {
+        try {
+          const updatedSession = await refetchCurrentSession()
+          if (updatedSession.data?.messages) {
+            setMessages(prev => {
+              // 如果後端消息數量明顯比較多，或者長度一樣但內容不同，使用後端的比較安全
+              if (updatedSession.data.messages.length >= prev.length) {
+                // 使用合併策略，確保不丟失任何消息
+                return mergeMessages(prev, updatedSession.data.messages)
+              }
+              return prev; // 後端資料還沒跟上，保留前端的
+            })
+          }
+        } catch (error) {
+          console.error('Failed to sync session:', error)
+          // 不拋出錯誤，保留當前消息
+        }
+      }, 500) // 延遲 500ms 確保後端已保存，可以考慮 retry 機制
     } catch (error) {
       console.error('Error sending message:', error)
       
@@ -365,7 +475,11 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
 
   // Switch session
   const switchSession = useCallback((sessionId: string) => {
-    setCurrentSessionId(sessionId)
+    setIsSwitchingSession(true); // 設置切換狀態
+    setCurrentSessionId(sessionId);
+    setMessages([]); // 1. 立即清空，防止殘影
+    // 2. 觸發 React Query 加載新 ID
+    // useEffect 會在 currentSession 加載完成後自動更新消息並清除 isSwitchingSession
   }, [])
 
   // Create session
@@ -413,6 +527,7 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
     charCount,
     thinkingSteps,
     isThinking,
+    isSwitchingSession,
 
     // Actions
     createSession,

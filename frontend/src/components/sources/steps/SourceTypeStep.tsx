@@ -159,7 +159,7 @@ export function SourceTypeStep({ control, register, errors }: SourceTypeStepProp
                   )}
                   
                   {type.value === 'upload' && (
-                    <div>
+                    <div className="w-full">
                       <Label htmlFor="file" className="mb-2 block">
                         {selectedFiles.length > 0 
                           ? `Files * (${selectedFiles.length} selected)`
@@ -182,17 +182,22 @@ export function SourceTypeStep({ control, register, errors }: SourceTypeStepProp
                       
                       {/* Display selected files */}
                       {selectedFiles.length > 0 && (
-                        <div className="mt-3 space-y-2">
+                        <div className="mt-3 space-y-2 w-full">
                           <p className="text-sm font-medium">Selected files:</p>
-                          <div className="space-y-1 max-h-48 overflow-y-auto">
+                          <div className="space-y-1 max-h-48 overflow-y-auto w-full">
                             {selectedFiles.map((file, index) => (
                               <div
                                 key={index}
-                                className="flex items-center justify-between p-2 bg-muted rounded-md text-sm"
+                                className="flex items-center justify-between gap-2 p-2 bg-muted rounded-md text-sm w-full max-w-full min-w-0"
                               >
-                                <div className="flex-1 min-w-0">
-                                  <p className="font-medium truncate">{file.name}</p>
-                                  <p className="text-xs text-muted-foreground">
+                                <div className="flex-1 min-w-0 overflow-hidden">
+                                  <p 
+                                    className="font-medium truncate" 
+                                    title={file.name}
+                                  >
+                                    {file.name}
+                                  </p>
+                                  <p className="text-xs text-muted-foreground truncate">
                                     {formatFileSize(file.size)}
                                   </p>
                                 </div>
@@ -200,7 +205,7 @@ export function SourceTypeStep({ control, register, errors }: SourceTypeStepProp
                                   type="button"
                                   variant="ghost"
                                   size="icon"
-                                  className="h-6 w-6 ml-2"
+                                  className="h-6 w-6 shrink-0"
                                   onClick={() => handleRemoveFile(index)}
                                 >
                                   <X className="h-4 w-4" />

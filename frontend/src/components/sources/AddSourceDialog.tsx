@@ -79,6 +79,10 @@ const WIZARD_STEPS: readonly WizardStep[] = [
 interface ProcessingState {
   message: string
   progress?: number
+  current?: number
+  total?: number
+  failed?: number
+  successful?: number
 }
 
 export function AddSourceDialog({ 
@@ -226,36 +230,115 @@ export function AddSourceDialog({
     setSelectedTransformations(updated)
   }
 
+  // Helper function to get filename without extension
+  const getFileNameWithoutExtension = (filename: string): string => {
+    const lastDotIndex = filename.lastIndexOf('.')
+    return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
+  }
+
   // Form submission
   const onSubmit = async (data: CreateSourceFormData) => {
     try {
       setProcessing(true)
-      setProcessingStatus({ message: 'Submitting source for processing...' })
 
-      const createRequest: CreateSourceRequest = {
-        type: data.type,
-        notebooks: selectedNotebooks,
-        url: data.type === 'link' ? data.url : undefined,
-        content: data.type === 'text' ? data.content : undefined,
-        title: data.title,
-        transformations: selectedTransformations,
-        embed: data.embed,
-        build_pageindex: data.build_pageindex,
-        delete_source: false,
-        async_processing: true, // Always use async processing for frontend submissions
+      // Check if this is a batch upload (multiple files)
+      const isBatchUpload = data.type === 'upload' && 
+                           data.file && 
+                           data.file instanceof FileList && 
+                           data.file.length > 1
+
+      if (isBatchUpload) {
+        // Batch upload mode
+        const files = Array.from(data.file as FileList)
+        const totalFiles = files.length
+        let successful = 0
+        let failed = 0
+
+        setProcessingStatus({ 
+          message: `Uploading files... (0/${totalFiles})`,
+          current: 0,
+          total: totalFiles,
+          successful: 0,
+          failed: 0
+        })
+
+        // Process each file sequentially
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i]
+          const fileName = getFileNameWithoutExtension(file.name)
+
+          setProcessingStatus({ 
+            message: `Uploading "${file.name}"... (${i + 1}/${totalFiles})`,
+            current: i + 1,
+            total: totalFiles,
+            successful,
+            failed
+          })
+
+          try {
+            const createRequest: CreateSourceRequest & { file?: File } = {
+              type: 'upload',
+              notebooks: selectedNotebooks,
+              title: fileName, // Use filename as title
+              transformations: selectedTransformations,
+              embed: data.embed,
+              build_pageindex: data.build_pageindex,
+              delete_source: false,
+              async_processing: true,
+              file: file, // Include file in the request
+            }
+
+            await createSource.mutateAsync(createRequest)
+            successful++
+          } catch (error) {
+            console.error(`Error uploading file "${file.name}":`, error)
+            failed++
+            // Continue with next file even if this one fails
+          }
+        }
+
+        // Show final status
+        setProcessingStatus({ 
+          message: `Upload complete: ${successful} successful, ${failed} failed`,
+          current: totalFiles,
+          total: totalFiles,
+          successful,
+          failed
+        })
+
+        // Wait a bit before closing to show final status
+        setTimeout(() => {
+          handleClose()
+        }, 2000)
+      } else {
+        // Single file or non-upload mode (existing behavior)
+        setProcessingStatus({ message: 'Submitting source for processing...' })
+
+        const createRequest: CreateSourceRequest = {
+          type: data.type,
+          notebooks: selectedNotebooks,
+          url: data.type === 'link' ? data.url : undefined,
+          content: data.type === 'text' ? data.content : undefined,
+          title: data.title,
+          transformations: selectedTransformations,
+          embed: data.embed,
+          build_pageindex: data.build_pageindex,
+          delete_source: false,
+          async_processing: true, // Always use async processing for frontend submissions
+        }
+
+        
+        if (data.type === 'upload' && data.file) {
+          const file = data.file instanceof FileList ? data.file[0] : data.file
+          const requestWithFile = createRequest as CreateSourceRequest & { file?: File }
+          requestWithFile.file = file
+        }
+
+        await createSource.mutateAsync(createRequest)
+
+        // Close immediately - the toast will show the success message
+        handleClose()
       }
-
-      
-      if (data.type === 'upload' && data.file) {
-        const file = data.file instanceof FileList ? data.file[0] : data.file
-        const requestWithFile = createRequest as CreateSourceRequest & { file?: File }
-        requestWithFile.file = file
-      }
-
-      await createSource.mutateAsync(createRequest)
-
-      // Close immediately - the toast will show the success message
-      handleClose()
     } catch (error) {
       console.error('Error creating source:', error)
       setProcessingStatus({ 
