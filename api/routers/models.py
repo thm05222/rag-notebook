@@ -225,15 +225,18 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
             logger.info(f"Merged role_default_models: {merged_role_models}")
             defaults.role_default_models = merged_role_models  # type: ignore[attr-defined]
         
-        # Update if we cleaned invalid references or if user provided updates
-        if needs_update or (
+        # Check if we need to update (either cleaned invalid references or user provided updates)
+        needs_update = bool(cleaned_fields) or (
             defaults_data.default_chat_model is not None
             or defaults_data.default_transformation_model is not None
             or defaults_data.large_context_model is not None
             or defaults_data.default_embedding_model is not None
             or defaults_data.default_tools_model is not None
             or defaults_data.role_default_models is not None
-        ):
+        )
+        
+        # Update if we cleaned invalid references or if user provided updates
+        if needs_update:
             await defaults.update()
             
             # Refresh the model manager cache

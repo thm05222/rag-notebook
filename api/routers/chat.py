@@ -839,7 +839,7 @@ def build_error_event(message: str) -> str:
     return f"data: {json.dumps(event_data)}\n\n"
 
 
-def build_complete_event(final_answer: Optional[str] = None, session_id: Optional[str] = None) -> str:
+def build_complete_event(final_answer: Optional[str] = None, session_id: Optional[str] = None, thinking_process: Optional[AgentThinkingProcess] = None) -> str:
     """構建完成事件（SSE 格式）"""
     event_data = {
         "type": "complete",
@@ -848,6 +848,9 @@ def build_complete_event(final_answer: Optional[str] = None, session_id: Optiona
         event_data["final_answer"] = final_answer
     if session_id:
         event_data["session_id"] = session_id
+    if thinking_process:
+        # 將 AgentThinkingProcess 轉換為字典格式以便 JSON 序列化
+        event_data["thinking_process"] = thinking_process.model_dump() if hasattr(thinking_process, "model_dump") else thinking_process.dict() if hasattr(thinking_process, "dict") else thinking_process
     return f"data: {json.dumps(event_data)}\n\n"
 
 
@@ -1079,8 +1082,18 @@ async def stream_chat_response(
             except Exception as state_error:
                 logger.warning(f"stream_chat_response: Failed to get final state: {state_error}")
         
-        # 發送完成事件（包含實際的 session_id，如果會話被自動創建）
-        yield build_complete_event(final_answer, actual_session_id)
+        # 構建 thinking_process 從最終狀態
+        thinking_process = None
+        try:
+            final_state = await chat_graph.aget_state(config=config_dict)
+            if final_state and hasattr(final_state, 'values'):
+                state_values = final_state.values
+                thinking_process = build_thinking_process_from_state(state_values)
+        except Exception as thinking_error:
+            logger.warning(f"stream_chat_response: Failed to build thinking_process: {thinking_error}")
+        
+        # 發送完成事件（包含實際的 session_id 和 thinking_process，如果會話被自動創建）
+        yield build_complete_event(final_answer, actual_session_id, thinking_process)
         
         # [調試] 驗證消息是否正確保存到 LangGraph 狀態
         try:

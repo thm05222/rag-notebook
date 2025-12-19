@@ -326,6 +326,62 @@ export function useNotebookChat({ notebookId, sources, contextSelections }: UseN
                 // [關鍵修復]：標記剛完成串流，防止 session ID 變更時清空消息
                 justFinishedStreamingRef.current = true
                 
+                // [新增] 強制將 final_answer 加入前端狀態
+                const finalAnswer = data.final_answer
+                const thinkingProcess = data.thinking_process
+                if (finalAnswer) {
+                  setMessages(prev => {
+                    // 檢查是否已經有這條訊息 (避免重複)
+                    const lastMsg = prev[prev.length - 1];
+                    if (lastMsg && lastMsg.type === 'ai' && lastMsg.content === finalAnswer) {
+                      console.log('[useNotebookChat] Final answer already exists, skipping')
+                      // 即使內容相同，也要更新 thinking_process
+                      if (thinkingProcess) {
+                        return prev.map(msg => 
+                          msg.id === lastMsg.id 
+                            ? { ...msg, thinking_process: thinkingProcess } 
+                            : msg
+                        );
+                      }
+                      return prev;
+                    }
+                    
+                    // 如果最後一條是正在生成的 AI 訊息，更新它
+                    if (aiMessage) {
+                      console.log('[useNotebookChat] Updating existing AI message with final answer')
+                      return prev.map(msg => 
+                        msg.id === aiMessage!.id 
+                          ? { ...msg, content: finalAnswer, thinking_process: thinkingProcess } 
+                          : msg
+                      );
+                    }
+                    
+                    // 否則，新增一條
+                    console.log('[useNotebookChat] Adding new AI message with final answer')
+                    return [...prev, {
+                      id: `ai-complete-${Date.now()}`,
+                      type: 'ai' as const,
+                      content: finalAnswer,
+                      timestamp: new Date().toISOString(),
+                      thinking_process: thinkingProcess
+                    }];
+                  });
+                } else if (thinkingProcess) {
+                  // 即使沒有 final_answer，也要更新最後一條 AI 訊息的 thinking_process
+                  setMessages(prev => {
+                    const lastMsg = prev[prev.length - 1];
+                    if (lastMsg && lastMsg.type === 'ai') {
+                      console.log('[useNotebookChat] Updating last AI message with thinking_process')
+                      return prev.map(msg => 
+                        msg.id === lastMsg.id 
+                          ? { ...msg, thinking_process: thinkingProcess } 
+                          : msg
+                      );
+                    }
+                    return prev;
+                  });
+                }
+                
                 // 只更新 ID，不覆蓋訊息
                 // 因為後端可能還沒寫入完成，這裡去 fetch 往往會拿到空列表，導致畫面洗白
                 if (data.session_id && data.session_id !== sessionId) {

@@ -96,6 +96,110 @@ export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }:
     }
   }
 
+  // 優化步驟：去重、合併和排序
+  const optimizeSteps = (steps: AgentThinkingStep[]): AgentThinkingStep[] => {
+    if (!steps || steps.length === 0) return []
+
+    // 1. 按時間戳排序
+    const sortedSteps = [...steps].sort((a, b) => a.timestamp - b.timestamp)
+
+    // 2. 去重和合併相似的步驟
+    const optimized: AgentThinkingStep[] = []
+    const decisionMap = new Map<string, AgentThinkingStep[]>() // tool_name -> steps
+    const toolCallMap = new Map<string, AgentThinkingStep[]>() // tool_name -> steps
+
+    for (const step of sortedSteps) {
+      if (step.step_type === 'decision') {
+        // 提取工具名稱
+        const toolMatch = step.content.match(/use_tool:(\w+)|Tool:\s*(\w+)/)
+        const toolName = toolMatch ? (toolMatch[1] || toolMatch[2]) : null
+        
+        if (toolName) {
+          if (!decisionMap.has(toolName)) {
+            decisionMap.set(toolName, [])
+          }
+          decisionMap.get(toolName)!.push(step)
+        } else {
+          // 沒有工具名稱的決策，直接添加
+          optimized.push(step)
+        }
+      } else if (step.step_type === 'tool_call') {
+        // 提取工具名稱
+        const toolMatch = step.content.match(/Tool:\s*(\w+)/)
+        const toolName = toolMatch ? toolMatch[1] : null
+        
+        if (toolName) {
+          if (!toolCallMap.has(toolName)) {
+            toolCallMap.set(toolName, [])
+          }
+          toolCallMap.get(toolName)!.push(step)
+        } else {
+          optimized.push(step)
+        }
+      } else {
+        // 其他類型的步驟（search, evaluation等）直接添加，不過濾
+        optimized.push(step)
+      }
+    }
+
+    // 3. 合併重複的決策：每個工具只保留一個，但顯示執行次數
+    for (const [toolName, decisionSteps] of decisionMap.entries()) {
+      if (decisionSteps.length === 1) {
+        optimized.push(decisionSteps[0])
+      } else {
+        // 合併多個相同工具的決策，使用最後一個的時間戳
+        const lastStep = decisionSteps[decisionSteps.length - 1]
+        const count = decisionSteps.length
+        optimized.push({
+          ...lastStep,
+          content: `Decision: use_tool:${toolName}${count > 1 ? ` (executed ${count} times)` : ''}`,
+          metadata: {
+            ...lastStep.metadata,
+            repeat_count: count,
+            tool_name: toolName
+          }
+        })
+      }
+    }
+
+    // 4. 合併重複的工具調用：每個工具只保留最後一個，但顯示執行次數和總結果數
+    for (const [toolName, toolCallSteps] of toolCallMap.entries()) {
+      if (toolCallSteps.length === 1) {
+        optimized.push(toolCallSteps[0])
+      } else {
+        // 合併多個相同工具的調用
+        const lastStep = toolCallSteps[toolCallSteps.length - 1]
+        const count = toolCallSteps.length
+        
+        // 計算總結果數
+        let totalResults = 0
+        for (const step of toolCallSteps) {
+          const resultMatch = step.content.match(/Results:\s*(\d+)/)
+          if (resultMatch) {
+            totalResults += parseInt(resultMatch[1], 10)
+          }
+        }
+        
+        optimized.push({
+          ...lastStep,
+          content: `Tool: ${toolName} | Executed ${count} times | Total Results: ${totalResults}`,
+          metadata: {
+            ...lastStep.metadata,
+            repeat_count: count,
+            total_results: totalResults,
+            tool_name: toolName
+          }
+        })
+      }
+    }
+
+    // 5. 再次按時間戳排序
+    return optimized.sort((a, b) => a.timestamp - b.timestamp)
+  }
+
+  // 使用優化後的步驟
+  const optimizedSteps = optimizeSteps(thinkingProcess.steps)
+
   console.log('[ThinkingProcessDisplay] Rendering Collapsible with isOpen:', isOpen)
 
   return (
@@ -110,7 +214,7 @@ export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }:
             <Brain className="h-3 w-3" />
             Thinking Process
             <Badge variant="secondary" className="ml-2">
-              {thinkingProcess.steps.length} steps
+              {optimizedSteps.length} steps
             </Badge>
             {thinkingProcess.total_iterations > 0 && (
               <Badge variant="outline" className="ml-1">
@@ -156,10 +260,10 @@ export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }:
           <CardContent className="space-y-2">
             {/* Steps Timeline */}
             <div className="space-y-3">
-              {thinkingProcess.steps.map((step, index) => (
+              {optimizedSteps.map((step, index) => (
                 <div key={index} className="flex gap-3">
                   {/* Timeline line */}
-                  {index < thinkingProcess.steps.length - 1 && (
+                  {index < optimizedSteps.length - 1 && (
                     <div className="flex flex-col items-center">
                       <div className={`rounded-full p-1.5 ${getStepColor(step.step_type)}`}>
                         {getStepIcon(step.step_type)}

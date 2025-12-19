@@ -235,4 +235,5 @@ export interface ChatStreamEvent {
   timestamp?: number
   final_answer?: string
   session_id?: string  // Optional: new session ID if session was auto-created
+  thinking_process?: AgentThinkingProcess  // Optional: thinking process from backend
 }

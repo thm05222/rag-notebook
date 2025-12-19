@@ -12,7 +12,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import aiosqlite
 from ai_prompter import Prompter
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers.pydantic import PydanticOutputParser
 from langchain_core.runnables import RunnableConfig
 
@@ -2170,7 +2170,10 @@ async def synthesize_answer(
             logger.warning(
                 f"[Iteration {iteration}] synthesize_answer: Evaluation rejected but near iteration limit, forcing final_answer"
             )
+            # 關鍵修復：將最終答案添加到 messages 狀態中
+            ai_message = AIMessage(content=answer)
             return {
+                "messages": [ai_message],  # [新增] 這一行至關重要，將回答寫入對話歷史
                 "partial_answer": answer,
                 "final_answer": answer,  # 強制設置 final_answer
                 "hallucination_check": hallucination_check,
