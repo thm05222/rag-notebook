@@ -452,9 +452,10 @@ class InternetSearchTool(BaseTool):
         limit = kwargs.get("limit", 10)
 
         try:
-            # Execute search with region set to 'wt-wt' for worldwide English results
-            with DDGS(region='wt-wt') as ddgs:
-                results = list(ddgs.text(query, max_results=limit))
+            # Execute search with region set to 'wt-wt' for worldwide results
+            # Note: 'region' is now passed to text() method, not DDGS() constructor
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, region='wt-wt', max_results=limit))
 
             # Format results to match other search tools
             formatted_results = []

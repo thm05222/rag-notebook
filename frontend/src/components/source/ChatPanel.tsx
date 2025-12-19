@@ -92,6 +92,11 @@ export function ChatPanel({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const { openModal } = useModalManager()
 
+  // Debug: Monitor thinkingSteps changes
+  useEffect(() => {
+    console.log('[ChatPanel] thinkingSteps updated:', thinkingSteps.length, 'isStreaming:', isStreaming)
+  }, [thinkingSteps, isStreaming])
+
   // Scroll handler to detect user position
   const handleScroll = useCallback(() => {
     const scrollArea = scrollAreaRef.current
@@ -169,16 +174,20 @@ export function ChatPanel({
   }, [allReferences, contextIndicators])
 
   // Fetch individual sources for source chat (not notebook chat) using useQueries
+  // Note: Some sources may have been deleted but are still referenced in chat history
   const sourceQueries = useQueries({
     queries: sourceIds.map(id => ({
       queryKey: QUERY_KEYS.source(id),
       queryFn: () => sourcesApi.get(id),
       enabled: !!id,
       staleTime: 30 * 1000,
+      retry: false, // Don't retry for deleted sources
+      // Silently handle 404/500 errors for deleted sources
     }))
   })
   
   // Fetch insights to get their source_ids using useQueries
+  // Note: Some insights may have been deleted but are still referenced in chat history
   const insightQueries = useQueries({
     queries: insightIds.map(id => {
       const insightIdWithPrefix = id.includes(':') ? id : `source_insight:${id}`
@@ -187,6 +196,7 @@ export function ChatPanel({
         queryFn: () => insightsApi.get(insightIdWithPrefix),
         enabled: !!id,
         staleTime: 30 * 1000,
+        retry: false, // Don't retry for deleted insights
       }
     })
   })
@@ -207,12 +217,14 @@ export function ChatPanel({
   }, [insightQueries, sourceIds])
 
   // Fetch additional sources for insights using useQueries
+  // Note: Some sources may have been deleted but are still referenced in chat history
   const insightSourceQueries = useQueries({
     queries: insightSourceIds.map(id => ({
       queryKey: QUERY_KEYS.source(id),
       queryFn: () => sourcesApi.get(id),
       enabled: !!id,
       staleTime: 30 * 1000,
+      retry: false, // Don't retry for deleted sources
     }))
   })
 
@@ -310,14 +322,16 @@ export function ChatPanel({
   }
 
   // Smart auto-scroll: only scroll if user is near bottom
+  // [關鍵修復] 添加 thinkingSteps 和 isStreaming 作為依賴
+  // 這樣當思考過程更新時，也會自動滾動到底部
   useEffect(() => {
     if (isNearBottom) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-    } else if (messages.length > 0) {
+    } else if (messages.length > 0 || (isStreaming && thinkingSteps.length > 0)) {
       // User scrolled up, show "new messages" indicator
       setHasNewMessages(true)
     }
-  }, [messages, isNearBottom])
+  }, [messages, isNearBottom, thinkingSteps, isStreaming])
 
   // Attach scroll listener to ScrollArea viewport
   useEffect(() => {
@@ -405,11 +419,7 @@ export function ChatPanel({
                 <p className="text-xs mt-2">Ask questions to understand the content better</p>
               </div>
             ) : (
-              messages.map((message, index) => {
-                const isLastMessage = index === messages.length - 1
-                const isStreamingLastMessage = isLastMessage && isStreaming && message.type === 'ai'
-                const showLiveThinking = isStreamingLastMessage && thinkingSteps.length > 0
-
+              messages.map((message) => {
                 return (
                   <div
                     key={message.id}
@@ -428,19 +438,6 @@ export function ChatPanel({
                       {/* 決策過程顯示（在消息泡泡上方） */}
                       {message.type === 'ai' && message.thinking_process && (
                         <AgentDecisionDisplay thinkingProcess={message.thinking_process} />
-                      )}
-                      
-                      {/* 即時思考過程顯示（僅在串流中顯示） */}
-                      {showLiveThinking && (
-                        <ThinkingProcessDisplay 
-                          thinkingProcess={{
-                            steps: thinkingSteps,
-                            total_iterations: 0,
-                            total_tool_calls: thinkingSteps.filter(s => s.step_type === 'tool_call').length,
-                            search_count: thinkingSteps.filter(s => s.step_type === 'search').length,
-                            reasoning_trace: []
-                          }}
-                        />
                       )}
                       
                       <div
@@ -462,8 +459,8 @@ export function ChatPanel({
                       </div>
                       {message.type === 'ai' && (
                         <>
-                          {/* 最終思考過程（完成後顯示，不與即時思考重複） */}
-                          {message.thinking_process && !showLiveThinking && (
+                          {/* 最終思考過程（完成後顯示） */}
+                          {message.thinking_process && (
                             <ThinkingProcessDisplay thinkingProcess={message.thinking_process} />
                           )}
                           <MessageActions
@@ -484,7 +481,33 @@ export function ChatPanel({
                 )
               })
             )}
-            {isStreaming && (
+            {/* 即時思考過程：在串流中且有思考步驟時顯示（在消息列表之後） */}
+            {isStreaming && thinkingSteps.length > 0 && (
+              <div className="flex gap-3 justify-start">
+                <div className="flex-shrink-0">
+                  <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
+                    <Bot className="h-4 w-4" />
+                  </div>
+                </div>
+                <div className="flex flex-col gap-2 max-w-[80%]">
+                  <ThinkingProcessDisplay 
+                    thinkingProcess={{
+                      steps: thinkingSteps,
+                      total_iterations: 0,
+                      total_tool_calls: thinkingSteps.filter(s => s.step_type === 'tool_call').length,
+                      search_count: thinkingSteps.filter(s => s.step_type === 'search').length,
+                      reasoning_trace: []
+                    }}
+                    defaultOpen={true}
+                  />
+                  <div className="rounded-lg px-4 py-2 bg-muted">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  </div>
+                </div>
+              </div>
+            )}
+            {/* 純 Loading 指示器：串流中但無思考步驟時顯示 */}
+            {isStreaming && thinkingSteps.length === 0 && (
               <div className="flex gap-3 justify-start">
                 <div className="flex-shrink-0">
                   <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">

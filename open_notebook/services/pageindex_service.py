@@ -318,10 +318,45 @@ class PageIndexService:
             logger.exception(e)
             raise
 
+    async def _get_index_for_source(
+        self, source_id: str
+    ) -> Optional[PageIndexStructure]:
+        """
+        只讀方法：獲取已存在的 PageIndex 結構（不會自動建立）
+        
+        用於搜索操作 - PageIndex 應該由用戶預先建立，
+        搜索時不應該觸發自動建立。
+        
+        Returns:
+            PageIndexStructure if found, None if not exists
+        """
+        # 1. 檢查內存緩存
+        if source_id in self._index_cache:
+            logger.debug(f"PageIndex cache hit for source {source_id}")
+            return self._index_cache[source_id]
+        
+        # 2. 從數據庫載入
+        try:
+            cached_structure = await self._load_index_from_database(source_id)
+            if cached_structure:
+                logger.info(f"Loaded PageIndex from database for source {source_id}")
+                self._index_cache[source_id] = cached_structure
+                return cached_structure
+        except Exception as e:
+            logger.warning(f"Failed to load PageIndex from database for source {source_id}: {e}")
+        
+        # 3. 不存在則返回 None（不自動建立）
+        return None
+
     async def _get_or_create_index_for_source(
         self, source_id: str, source: Source, model_id: Optional[str] = None
     ) -> PageIndexStructure:
-        """為 source 獲取或創建 PageIndex 樹狀結構（優先從數據庫讀取）"""
+        """
+        為 source 獲取或創建 PageIndex 樹狀結構（優先從數據庫讀取）
+        
+        注意：此方法會在找不到索引時自動建立，僅用於明確要求建立索引的場景。
+        對於搜索操作，請使用 _get_index_for_source()。
+        """
         # 1. 檢查內存緩存
         if source_id in self._index_cache:
             logger.debug(f"PageIndex cache hit for source {source_id}")
@@ -889,16 +924,22 @@ Directly return the final JSON structure. Do not output anything else."""
                     logger.warning(f"No sources found in notebook {notebook_id}")
                     return []
 
-                # 為每個 source 建立索引並搜索
+                # 為每個 source 搜索（只使用已存在的 PageIndex，不自動建立）
                 per_source_limit = max(1, limit // len(sources))
                 failed_sources = []
+                skipped_sources = []  # 沒有 PageIndex 的 sources
                 for source in sources:
                     try:
-                        # 獲取完整的 source（包含 full_text）
+                        # 獲取完整的 source
                         full_source = await Source.get(source.id)
-                        tree_structure = await self._get_or_create_index_for_source(
-                            full_source.id, full_source, model_id
-                        )
+                        
+                        # 只讀取已存在的 PageIndex，不自動建立
+                        tree_structure = await self._get_index_for_source(full_source.id)
+                        if not tree_structure:
+                            logger.info(f"Source {full_source.id} does not have PageIndex, skipping")
+                            skipped_sources.append(full_source.id)
+                            continue
+                        
                         results = await self._tree_search(query, tree_structure, model_id, per_source_limit)
                         # 為結果添加 source 信息
                         for result in results:
@@ -910,8 +951,23 @@ Directly return the final JSON structure. Do not output anything else."""
                         failed_sources.append({"source_id": source.id, "error": str(e)})
                         continue
                 
-                # 如果所有 sources 都失敗，拋出異常
-                if len(failed_sources) == len(sources) and len(all_results) == 0:
+                # 記錄跳過的 sources
+                if skipped_sources:
+                    logger.info(
+                        f"Skipped {len(skipped_sources)} sources without PageIndex: {skipped_sources[:5]}..."
+                        if len(skipped_sources) > 5 else 
+                        f"Skipped {len(skipped_sources)} sources without PageIndex: {skipped_sources}"
+                    )
+                
+                # 如果所有 sources 都沒有 PageIndex 或失敗，拋出異常
+                if len(failed_sources) + len(skipped_sources) == len(sources) and len(all_results) == 0:
+                    if skipped_sources:
+                        raise ToolExecutionError(
+                            f"None of the {len(sources)} sources have PageIndex structure. "
+                            f"Please build PageIndex for sources first before using pageindex_search. "
+                            f"Consider using vector_search as an alternative."
+                        )
+                    else:
                     error_summary = "; ".join([f"{fs['source_id']}: {fs['error']}" for fs in failed_sources[:3]])
                     raise ToolExecutionError(
                         f"All {len(sources)} sources failed to search. "
@@ -920,11 +976,12 @@ Directly return the final JSON structure. Do not output anything else."""
                     )
 
             elif source_ids:
-                # 方式 3: 搜索指定的 sources
+                # 方式 3: 搜索指定的 sources（只使用已存在的 PageIndex，不自動建立）
                 logger.info(f"Searching sources: {source_ids}")
                 per_source_limit = max(1, limit // len(source_ids))
                 
                 failed_sources = []
+                skipped_sources = []  # 沒有 PageIndex 的 sources
                 for source_id in source_ids:
                     try:
                         # 預驗證 source 是否存在
@@ -935,9 +992,13 @@ Directly return the final JSON structure. Do not output anything else."""
                             failed_sources.append({"source_id": source_id, "error": f"Source not found: {str(e)}"})
                             continue
                         
-                        tree_structure = await self._get_or_create_index_for_source(
-                            source.id, source, model_id
-                        )
+                        # 只讀取已存在的 PageIndex，不自動建立
+                        tree_structure = await self._get_index_for_source(source.id)
+                        if not tree_structure:
+                            logger.info(f"Source {source.id} does not have PageIndex, skipping")
+                            skipped_sources.append(source.id)
+                            continue
+                        
                         results = await self._tree_search(query, tree_structure, model_id, per_source_limit)
                         # 為結果添加 source 信息
                         for result in results:
@@ -949,8 +1010,23 @@ Directly return the final JSON structure. Do not output anything else."""
                         failed_sources.append({"source_id": source_id, "error": str(e)})
                         continue
                 
-                # 如果所有 sources 都失敗，拋出異常
-                if len(failed_sources) == len(source_ids) and len(all_results) == 0:
+                # 記錄跳過的 sources
+                if skipped_sources:
+                    logger.info(
+                        f"Skipped {len(skipped_sources)} sources without PageIndex: {skipped_sources[:5]}..."
+                        if len(skipped_sources) > 5 else 
+                        f"Skipped {len(skipped_sources)} sources without PageIndex: {skipped_sources}"
+                    )
+                
+                # 如果所有 sources 都沒有 PageIndex 或失敗，拋出異常
+                if len(failed_sources) + len(skipped_sources) == len(source_ids) and len(all_results) == 0:
+                    if skipped_sources:
+                        raise ToolExecutionError(
+                            f"None of the {len(source_ids)} specified sources have PageIndex structure. "
+                            f"Please build PageIndex for sources first before using pageindex_search. "
+                            f"Consider using vector_search as an alternative."
+                        )
+                    else:
                     error_summary = "; ".join([f"{fs['source_id']}: {fs['error']}" for fs in failed_sources[:3]])
                     raise ToolExecutionError(
                         f"All {len(source_ids)} sources failed to search. "

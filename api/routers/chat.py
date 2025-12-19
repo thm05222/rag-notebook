@@ -202,9 +202,11 @@ async def get_session_diagnostics(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
 
         # Get session state from LangGraph
+        # Note: thread_id should NOT have "chat_session:" prefix to match how messages are stored
+        thread_id = session_id.replace("chat_session:", "") if session_id.startswith("chat_session:") else session_id
         chat_graph = get_graph()
         thread_state = await chat_graph.aget_state(
-            config=RunnableConfig(configurable={"thread_id": session_id})
+            config=RunnableConfig(configurable={"thread_id": thread_id})
         )
         
         if not thread_state or not hasattr(thread_state, 'values'):
@@ -304,14 +306,25 @@ async def get_session(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
 
         # Get session state from LangGraph to retrieve messages
+        # Note: thread_id should NOT have "chat_session:" prefix to match how messages are stored
+        # (see execute_chat function where thread_id is extracted without prefix)
+        thread_id = session_id.replace("chat_session:", "") if session_id.startswith("chat_session:") else session_id
         chat_graph = get_graph()
         thread_state = await chat_graph.aget_state(
-            config=RunnableConfig(configurable={"thread_id": session_id})
+            config=RunnableConfig(configurable={"thread_id": thread_id})
         )
 
         # Extract messages from state
         messages: list[ChatMessage] = []
         state_values = thread_state.values if thread_state and hasattr(thread_state, 'values') else {}
+        
+        # [調試] 記錄從 LangGraph 獲取的原始消息數量
+        raw_messages = state_values.get("messages", []) if state_values else []
+        logger.info(f"[DEBUG get_session] thread_id={thread_id}, raw message count: {len(raw_messages)}")
+        for idx, msg in enumerate(raw_messages):
+            msg_type = msg.type if hasattr(msg, "type") else "unknown"
+            msg_content = msg.content[:50] if hasattr(msg, "content") and msg.content else "None"
+            logger.info(f"[DEBUG get_session] Message {idx}: type={msg_type}, preview={msg_content}...")
         
         # 構建思考過程（如果 state 中有相關數據）
         thinking_process = build_thinking_process_from_state(state_values) if state_values else None
@@ -876,16 +889,31 @@ async def stream_chat_response(
         # 不中斷執行，繼續進行
     
     try:
+        # 發送初始思考事件（確認前端能接收）
+        yield build_thought_event(
+            stage="planning",
+            content="正在分析您的問題...",
+            metadata={"phase": "init"},
+        )
+        logger.info("Stream: Sent initial thought event")
+        
+        # 移除 include_names 過濾器，以便捕獲所有事件（包括工具事件）
+        # 在事件處理時自行過濾需要的事件類型
+        event_count = 0
         async for event in chat_graph.astream_events(
             input=graph_input,
             config=config_dict,
             version="v2",
-            include_names=["orchestrator", "executor", "refiner"],
         ):
             event_type = event.get("event")
             name = event.get("name")
             tags = event.get("tags", [])
             data = event.get("data", {})
+            
+            # 調試日誌：記錄收到的事件
+            event_count += 1
+            if event_count <= 20:  # 只記錄前 20 個事件
+                logger.debug(f"Stream event #{event_count}: type={event_type}, name={name}, tags={tags}")
             
             # 捕獲 Orchestrator 決策
             if event_type == "on_chain_end" and name == "orchestrator":
@@ -1053,6 +1081,21 @@ async def stream_chat_response(
         
         # 發送完成事件（包含實際的 session_id，如果會話被自動創建）
         yield build_complete_event(final_answer, actual_session_id)
+        
+        # [調試] 驗證消息是否正確保存到 LangGraph 狀態
+        try:
+            debug_state = await chat_graph.aget_state(config=config_dict)
+            if debug_state and hasattr(debug_state, 'values'):
+                debug_messages = debug_state.values.get("messages", [])
+                logger.info(f"[DEBUG] Final state message count: {len(debug_messages)}")
+                for idx, msg in enumerate(debug_messages):
+                    msg_type = msg.type if hasattr(msg, "type") else "unknown"
+                    msg_content = msg.content[:50] if hasattr(msg, "content") and msg.content else "None"
+                    logger.info(f"[DEBUG] Message {idx}: type={msg_type}, content_preview={msg_content}...")
+            else:
+                logger.warning("[DEBUG] Could not retrieve final state or no values")
+        except Exception as debug_error:
+            logger.warning(f"[DEBUG] Failed to verify final state: {debug_error}")
         
     except Exception as e:
         logger.error(f"Error in stream_chat_response: {str(e)}")

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -20,13 +20,33 @@ import { formatDistanceToNow } from 'date-fns'
 
 interface ThinkingProcessDisplayProps {
   thinkingProcess: AgentThinkingProcess
+  /** 是否預設展開（用於即時顯示思考過程） */
+  defaultOpen?: boolean
 }
 
-export function ThinkingProcessDisplay({ thinkingProcess }: ThinkingProcessDisplayProps) {
-  const [isOpen, setIsOpen] = useState(false)
+export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }: ThinkingProcessDisplayProps) {
+  const [isOpen, setIsOpen] = useState(defaultOpen)
   const [showDetails, setShowDetails] = useState(false)
 
+  // [關鍵修復] 同步 defaultOpen prop 變化到 isOpen 狀態
+  // useState 只在首次掛載時使用初始值，後續 prop 變化不會自動更新狀態
+  useEffect(() => {
+    if (defaultOpen) {
+      setIsOpen(true)
+    }
+  }, [defaultOpen])
+
+  // 調試：記錄組件渲染狀態
+  useEffect(() => {
+    console.log('[ThinkingProcessDisplay] Rendered with:', {
+      stepsCount: thinkingProcess?.steps?.length || 0,
+      isOpen,
+      defaultOpen
+    })
+  }, [thinkingProcess?.steps?.length, isOpen, defaultOpen])
+
   if (!thinkingProcess || thinkingProcess.steps.length === 0) {
+    console.log('[ThinkingProcessDisplay] Returning null - no steps')
     return null
   }
 
@@ -75,6 +95,8 @@ export function ThinkingProcessDisplay({ thinkingProcess }: ThinkingProcessDispl
       return 'just now'
     }
   }
+
+  console.log('[ThinkingProcessDisplay] Rendering Collapsible with isOpen:', isOpen)
 
   return (
     <Collapsible open={isOpen} onOpenChange={setIsOpen} className="mt-2">

@@ -31,7 +31,7 @@ from open_notebook.config import UPLOADS_FOLDER, MAX_UPLOAD_SIZE
 from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.domain.notebook import Notebook, Source
 from open_notebook.domain.transformation import Transformation
-from open_notebook.exceptions import InvalidInputError
+from open_notebook.exceptions import InvalidInputError, NotFoundError
 
 router = APIRouter()
 
@@ -859,6 +859,8 @@ async def get_source(source_id: str):
         )
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error fetching source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching source: {str(e)}")

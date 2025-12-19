@@ -2227,7 +2227,13 @@ async def synthesize_answer(
                 f"[Iteration {iteration}] synthesize_answer: Answer rejected, generating feedback for Orchestrator"
             )
             
+            # [關鍵修復] 即使答案被 reject，也要添加 AI 消息到 messages
+            # 這樣當 should_accept_answer 強制接受時，消息會被保存
+            from langchain_core.messages import AIMessage
+            ai_message = AIMessage(content=answer)
+            
             return {
+                "messages": [ai_message],  # [關鍵修復] 添加 AI 消息，以便強制接受時能保存
                 "partial_answer": answer,
                 "final_answer": None,  # 不設為最終答案
                 "hallucination_check": hallucination_check,
