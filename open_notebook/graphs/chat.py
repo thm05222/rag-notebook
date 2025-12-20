@@ -758,12 +758,17 @@ async def agent_decision(
             logger.warning(f"Failed to build knowledge base overview: {e}")
             knowledge_base_overview = []
     
+    # 添加當前日期，讓 Agent 知道「過去一年」是什麼時間範圍
+    from datetime import datetime
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
     prompt_data = {
         "question": state["question"],
         "iteration_count": state["iteration_count"],
         "max_iterations": state["max_iterations"],
         "token_count": state["token_count"],
         "max_tokens": state["max_tokens"],
+        "current_date": current_date,  # 當前日期，用於時間相關查詢
         "search_history": state["search_history"][-3:],
         "collected_results": collected_results,  # 使用檢查過的 collected_results
         "collected_results_count": collected_results_count,  # 添加計數信息

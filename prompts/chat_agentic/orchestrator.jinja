@@ -14,6 +14,7 @@ Assistant: {{turn.assistant}}
 {% endif %}
 
 # CURRENT STATE
+- **Today's Date**: {{current_date}} (Use this for time-relative queries like "past year", "last month", etc.)
 - Iteration: {{iteration_count}} / {{max_iterations}}
 - Token Usage: {{token_count}} / {{max_tokens}}
 {% if collected_results_count is defined %}- Collected Results: {{collected_results_count}} items (~{{collected_results_tokens}} tokens){% endif %}

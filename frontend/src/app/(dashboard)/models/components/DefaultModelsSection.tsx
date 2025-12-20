@@ -52,25 +52,6 @@ const defaultConfigs: DefaultConfig[] = [
     isNested: true
   },
   {
-    key: 'default_transformation_model',
-    label: 'Transformation Model',
-    description: 'Used for summaries, insights, and transformations',
-    modelType: 'language',
-    required: true
-  },
-  {
-    key: 'default_tools_model',
-    label: 'Tools Model',
-    description: 'Used for function calling - OpenAI or Anthropic recommended',
-    modelType: 'language'
-  },
-  {
-    key: 'large_context_model',
-    label: 'Large Context Model',
-    description: 'Used for processing large documents - Gemini recommended',
-    modelType: 'language'
-  },
-  {
     key: 'default_embedding_model',
     label: 'Embedding Model',
     description: 'Used for semantic search and vector embeddings',

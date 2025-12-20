@@ -1192,12 +1192,18 @@ async def stream_chat_response(
         # 發送完成事件（包含實際的 session_id 和 thinking_process，如果會話被自動創建）
         yield build_complete_event(final_answer, actual_session_id, thinking_process)
         
-        # === [修復] 將最終答案保存到 session_thread_id ===
-        # 因為 graph 使用 internal_thread_id 執行，所以需要手動保存答案到 session_thread_id
+        # === [修復] 將最終答案和 thinking process 保存到 session_thread_id ===
+        # 因為 graph 使用 internal_thread_id 執行，所以需要手動複製數據到 session_thread_id
         try:
             from langchain_core.messages import AIMessage, HumanMessage
+            import time as time_module
             
-            if final_answer and session_thread_id:
+            if final_answer and session_thread_id and internal_thread_id:
+                # 從 internal_thread_id 獲取完整的執行狀態（包含 thinking process）
+                internal_config = RunnableConfig(configurable={"thread_id": internal_thread_id})
+                internal_state = await chat_graph.aget_state(config=internal_config)
+                internal_values = internal_state.values if internal_state and hasattr(internal_state, 'values') else {}
+                
                 # 獲取 session 的當前消息
                 session_config = RunnableConfig(configurable={"thread_id": session_thread_id})
                 session_state = await chat_graph.aget_state(config=session_config)
@@ -1213,17 +1219,69 @@ async def stream_chat_response(
                 if not final_answer_exists:
                     # 將 AI 回答保存到 session_thread_id
                     logger.info(f"[STATE ISOLATION] Saving final_answer to session_thread_id={session_thread_id} (length: {len(final_answer)} chars)")
+                    
+                    # 獲取用戶問題
+                    user_question = request.message if request else None
+                    
+                    # 需要同時保存 HumanMessage 和 AIMessage
+                    # 檢查是否已經有這個問題的 HumanMessage
+                    human_message_exists = any(
+                        (hasattr(msg, 'type') and msg.type == 'human') and 
+                        (hasattr(msg, 'content') and msg.content and user_question and msg.content[:50] == user_question[:50])
+                        for msg in session_messages
+                    )
+                    
+                    messages_to_add = []
+                    if not human_message_exists and user_question:
+                        messages_to_add.append(HumanMessage(content=user_question))
+                    messages_to_add.append(AIMessage(content=final_answer))
+                    
+                    # 構建完整的 messages 列表（現有 + 新增）
+                    all_messages = list(session_messages) + messages_to_add
+                    
+                    # 從 internal state 獲取 thinking process 相關數據
+                    # 這樣刷新頁面後仍然可以看到 thinking process
+                    full_state_update = {
+                        "messages": all_messages,
+                        "notebook": internal_values.get("notebook"),
+                        "context_config": internal_values.get("context_config"),
+                        "conversation_context": internal_values.get("conversation_context"),
+                        "question": user_question or internal_values.get("question", ""),
+                        "iteration_count": internal_values.get("iteration_count", 0),
+                        # 關鍵：保留 thinking process 相關數據
+                        "search_history": internal_values.get("search_history", []),
+                        "collected_results": internal_values.get("collected_results", []),
+                        "current_tool_calls": internal_values.get("current_tool_calls", []),
+                        "evaluation_result": internal_values.get("evaluation_result"),
+                        "hallucination_check": internal_values.get("hallucination_check"),
+                        "partial_answer": internal_values.get("partial_answer", ""),
+                        "final_answer": final_answer,
+                        "reasoning_trace": internal_values.get("reasoning_trace", []),
+                        "max_iterations": internal_values.get("max_iterations", 20),
+                        "token_count": internal_values.get("token_count", 0),
+                        "max_tokens": internal_values.get("max_tokens", 300000),
+                        "start_time": internal_values.get("start_time", time_module.time()),
+                        "max_duration": internal_values.get("max_duration", 300),
+                        "decision_history": internal_values.get("decision_history", []),
+                        "error_history": internal_values.get("error_history", []),
+                        "unavailable_tools": internal_values.get("unavailable_tools", []),
+                        "model_override": internal_values.get("model_override"),
+                        "current_decision": internal_values.get("current_decision"),
+                        "refinement_feedback": internal_values.get("refinement_feedback"),
+                    }
+                    
                     await chat_graph.aupdate_state(
                         config=session_config,
-                        values={
-                            "messages": [AIMessage(content=final_answer)],
-                        }
+                        values=full_state_update,
+                        as_node="refiner"
                     )
-                    logger.info("[STATE ISOLATION] Successfully saved AI message to session state")
+                    logger.info(f"[STATE ISOLATION] Successfully saved state to session (messages: {len(all_messages)}, search_history: {len(full_state_update['search_history'])}, reasoning_trace: {len(full_state_update['reasoning_trace'])})")
                 else:
                     logger.info("[STATE ISOLATION] Final answer already exists in session state")
         except Exception as fix_error:
             logger.warning(f"[STATE ISOLATION] Failed to save final answer to session: {fix_error}")
+            import traceback
+            logger.warning(f"[STATE ISOLATION] Traceback: {traceback.format_exc()}")
         
         # [調試] 驗證消息是否正確保存到 session state
         try:
@@ -1553,7 +1611,8 @@ async def execute_chat(request: ExecuteChatRequest):
                     try:
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
-                            values={"messages": messages}  # 只更新 messages
+                            values={"messages": messages},  # 只更新 messages
+                            as_node="refiner"  # 指定作為 refiner 節點的輸出
                         )
                         logger.info(f"Timeout recovery: Saved messages to LangGraph state")
                     except Exception as state_update_error:
@@ -1583,7 +1642,8 @@ async def execute_chat(request: ExecuteChatRequest):
                         }
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
-                            values=clear_values
+                            values=clear_values,
+                            as_node="initialize"  # 作為初始化節點的輸出
                         )
                         
                         # 驗證清空是否成功
@@ -1721,7 +1781,8 @@ async def execute_chat(request: ExecuteChatRequest):
                     try:
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
-                            values={"messages": messages}  # 只更新 messages
+                            values={"messages": messages},  # 只更新 messages
+                            as_node="refiner"  # 指定作為 refiner 節點的輸出
                         )
                         logger.info(f"Recursion limit fallback: Saved fallback answer to LangGraph state")
                     except Exception as state_update_error:
@@ -1752,7 +1813,8 @@ async def execute_chat(request: ExecuteChatRequest):
                         }
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
-                            values=clear_values
+                            values=clear_values,
+                            as_node="initialize"  # 作為初始化節點的輸出
                         )
                         
                         # 驗證清空是否成功
@@ -1893,7 +1955,8 @@ async def execute_chat(request: ExecuteChatRequest):
             }
             await chat_graph.aupdate_state(
                 config=RunnableConfig(configurable={"thread_id": thread_id}),
-                values=clear_values
+                values=clear_values,
+                as_node="initialize"  # 作為初始化節點的輸出
             )
             
             # 驗證清空是否成功
@@ -2150,7 +2213,8 @@ async def execute_chat(request: ExecuteChatRequest):
                         }
                         await chat_graph.aupdate_state(
                             config=RunnableConfig(configurable={"thread_id": thread_id}),
-                            values=clear_values
+                            values=clear_values,
+                            as_node="initialize"  # 作為初始化節點的輸出
                         )
                         
                         # 驗證清空是否成功

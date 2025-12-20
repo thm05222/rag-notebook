@@ -15,10 +15,7 @@ export interface CreateModelRequest {
 
 export interface ModelDefaults {
   default_chat_model?: string | null
-  default_transformation_model?: string | null
-  large_context_model?: string | null
   default_embedding_model?: string | null
-  default_tools_model?: string | null
   role_default_models?: {
     orchestrator?: string | null
     executor?: string | null
