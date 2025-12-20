@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -975,72 +976,17 @@ async def stream_chat_response(
     graph_input: Dict[str, Any],
     config_dict: Dict[str, Any],
     actual_session_id: Optional[str] = None,
+    session_thread_id: Optional[str] = None,  # 新增：用於保存最終答案的 session thread_id
 ) -> AsyncGenerator[str, None]:
     """串流聊天響應生成器"""
     chat_graph = get_graph()
     start_time = time.time()
     final_answer = None
     
-    # 關鍵：在調用 graph.astream_events 之前，強制清空所有 operator.add 字段
-    # 因為 operator.add 的行為是 舊列表 + 新列表，返回 [] 不會清空舊狀態
-    # 必須使用 aupdate_state 強制覆蓋
-    try:
-        thread_id = config_dict.get("configurable", {}).get("thread_id")
-        if thread_id:
-            config_for_update = RunnableConfig(configurable={"thread_id": thread_id})
-            
-            # === [新增] 清理前檢查狀態 ===
-            try:
-                state_before = await chat_graph.aget_state(config_for_update)
-                if state_before and state_before.values:
-                    before_collected = len(state_before.values.get("collected_results", []))
-                    before_search = len(state_before.values.get("search_history", []))
-                    if before_collected > 0 or before_search > 0:
-                        logger.warning(
-                            f"Pre-invoke state clear: Found residual data - "
-                            f"collected_results={before_collected}, search_history={before_search}"
-                        )
-            except Exception as check_error:
-                logger.debug(f"State check before clear failed (expected for new threads): {check_error}")
-            
-            logger.info(f"Pre-invoke state clear: Clearing all operator.add fields for thread_id={thread_id}")
-            # === [修復] 只重置列表類型的字段，避免 None 值導致錯誤 ===
-            # LangGraph 的 aupdate_state 對於非列表字段可能有不同行為
-            await chat_graph.aupdate_state(
-                config=config_for_update,
-                values={
-                    "search_history": [],
-                    "collected_results": [],
-                    "current_tool_calls": [],
-                    "reasoning_trace": [],
-                    "decision_history": [],
-                    "error_history": [],
-                    "unavailable_tools": [],
-                }
-            )
-            
-            # === [新增] 清理後驗證 ===
-            try:
-                state_after = await chat_graph.aget_state(config_for_update)
-                if state_after and state_after.values:
-                    after_collected = len(state_after.values.get("collected_results", []))
-                    after_search = len(state_after.values.get("search_history", []))
-                    logger.info(
-                        f"Pre-invoke state clear: Verification - "
-                        f"collected_results={after_collected}, search_history={after_search}"
-                    )
-                    if after_collected > 0 or after_search > 0:
-                        logger.error(
-                            f"Pre-invoke state clear: FAILED to clear residual data! "
-                            f"collected_results={after_collected}, search_history={after_search}"
-                        )
-            except Exception as verify_error:
-                logger.debug(f"State verification failed: {verify_error}")
-            
-            logger.info("Pre-invoke state clear: Successfully cleared all operator.add fields")
-    except Exception as clear_error:
-        logger.warning(f"Pre-invoke state clear failed: {clear_error}")
-        # 不中斷執行，繼續進行
+    # === [修復] 使用唯一的 internal_thread_id 確保每個問題從乾淨狀態開始 ===
+    # 不再需要清空狀態，因為每個問題使用獨立的 thread
+    internal_thread_id = config_dict.get("configurable", {}).get("thread_id")
+    logger.info(f"[STATE ISOLATION] Using internal_thread_id={internal_thread_id} for graph execution, session_thread_id={session_thread_id} for persistence")
     
     try:
         # 發送初始思考事件（確認前端能接收）
@@ -1246,78 +1192,55 @@ async def stream_chat_response(
         # 發送完成事件（包含實際的 session_id 和 thinking_process，如果會話被自動創建）
         yield build_complete_event(final_answer, actual_session_id, thinking_process)
         
-        # === [修復] 清理重複的 messages 並確保 AI message 正確保存 ===
+        # === [修復] 將最終答案保存到 session_thread_id ===
+        # 因為 graph 使用 internal_thread_id 執行，所以需要手動保存答案到 session_thread_id
         try:
             from langchain_core.messages import AIMessage, HumanMessage
             
-            # 獲取當前狀態
-            thread_id = config_dict.get("configurable", {}).get("thread_id")
-            current_state = await chat_graph.aget_state(config=config_dict)
-            
-            if current_state and hasattr(current_state, 'values'):
-                current_messages = current_state.values.get("messages", [])
-                
-                if len(current_messages) > 2:
-                    # === [新增] 去除重複的 messages ===
-                    # 使用 (type, content[:100]) 作為唯一鍵
-                    seen = set()
-                    deduplicated_messages = []
-                    
-                    for msg in current_messages:
-                        msg_type = msg.type if hasattr(msg, 'type') else 'unknown'
-                        msg_content = msg.content[:100] if hasattr(msg, 'content') and msg.content else ''
-                        key = (msg_type, msg_content)
-                        
-                        if key not in seen:
-                            seen.add(key)
-                            deduplicated_messages.append(msg)
-                        else:
-                            logger.warning(f"[DEDUP] Removing duplicate message: type={msg_type}, content={msg_content[:50]}...")
-                    
-                    # 如果有重複被移除，更新狀態
-                    if len(deduplicated_messages) < len(current_messages):
-                        logger.info(f"[DEDUP] Removed {len(current_messages) - len(deduplicated_messages)} duplicate messages")
-                        # 使用 aupdate_state 替換 messages（需要特殊處理 add_messages reducer）
-                        # 注意：這裡需要直接替換而不是添加
-                        # LangGraph 的 add_messages reducer 不支持直接替換，所以我們需要使用其他方法
-                        # 暫時只記錄，不修改狀態（避免破壞 add_messages 的行為）
-                        logger.warning(f"[DEDUP] Note: Cannot directly replace messages due to add_messages reducer. Duplicate messages will persist until session is cleared.")
+            if final_answer and session_thread_id:
+                # 獲取 session 的當前消息
+                session_config = RunnableConfig(configurable={"thread_id": session_thread_id})
+                session_state = await chat_graph.aget_state(config=session_config)
+                session_messages = session_state.values.get("messages", []) if session_state and hasattr(session_state, 'values') else []
                 
                 # 檢查是否已經有包含 final_answer 的 AI message
-                if final_answer:
-                    final_answer_exists = any(
-                        (hasattr(msg, 'type') and msg.type == 'ai') and 
-                        (hasattr(msg, 'content') and msg.content and msg.content[:100] == final_answer[:100])
-                        for msg in current_messages
+                final_answer_exists = any(
+                    (hasattr(msg, 'type') and msg.type == 'ai') and 
+                    (hasattr(msg, 'content') and msg.content and msg.content[:100] == final_answer[:100])
+                    for msg in session_messages
+                )
+                
+                if not final_answer_exists:
+                    # 將 AI 回答保存到 session_thread_id
+                    logger.info(f"[STATE ISOLATION] Saving final_answer to session_thread_id={session_thread_id} (length: {len(final_answer)} chars)")
+                    await chat_graph.aupdate_state(
+                        config=session_config,
+                        values={
+                            "messages": [AIMessage(content=final_answer)],
+                        }
                     )
-                    
-                    # 如果沒有對應的 AI message，手動添加
-                    if not final_answer_exists:
-                        logger.warning(f"[FIX] AI message not found in state, manually adding (length: {len(final_answer)} chars)")
-                        await chat_graph.aupdate_state(
-                            config=RunnableConfig(configurable={"thread_id": thread_id}),
-                            values={
-                                "messages": [AIMessage(content=final_answer)],
-                            }
-                        )
-                        logger.info("[FIX] Successfully added AI message to LangGraph state")
+                    logger.info("[STATE ISOLATION] Successfully saved AI message to session state")
+                else:
+                    logger.info("[STATE ISOLATION] Final answer already exists in session state")
         except Exception as fix_error:
-            logger.warning(f"[FIX] Failed to process messages: {fix_error}")
+            logger.warning(f"[STATE ISOLATION] Failed to save final answer to session: {fix_error}")
         
-        # [調試] 驗證消息是否正確保存到 LangGraph 狀態
+        # [調試] 驗證消息是否正確保存到 session state
         try:
-            debug_state = await chat_graph.aget_state(config=config_dict)
-            if debug_state and hasattr(debug_state, 'values'):
-                debug_messages = debug_state.values.get("messages", [])
-                logger.info(f"[DEBUG] Final state message count: {len(debug_messages)}")
-                for idx, msg in enumerate(debug_messages):
-                    msg_type = msg.type if hasattr(msg, "type") else "unknown"
-                    msg_content = msg.content[:50] if hasattr(msg, "content") and msg.content else "None"
-                    logger.info(f"[DEBUG] Message {idx}: type={msg_type}, content_preview={msg_content}...")
-            else:
-                logger.warning("[DEBUG] Could not retrieve final state or no values")
+            if session_thread_id:
+                debug_config = RunnableConfig(configurable={"thread_id": session_thread_id})
+                debug_state = await chat_graph.aget_state(config=debug_config)
+                if debug_state and hasattr(debug_state, 'values'):
+                    debug_messages = debug_state.values.get("messages", [])
+                    logger.info(f"[DEBUG] Session state message count: {len(debug_messages)}")
+                    for idx, msg in enumerate(debug_messages):
+                        msg_type = msg.type if hasattr(msg, "type") else "unknown"
+                        msg_content = msg.content[:50] if hasattr(msg, "content") and msg.content else "None"
+                        logger.info(f"[DEBUG] Message {idx}: type={msg_type}, content_preview={msg_content}...")
+                else:
+                    logger.warning("[DEBUG] Could not retrieve session state or no values")
         except Exception as debug_error:
-            logger.warning(f"[DEBUG] Failed to verify final state: {debug_error}")
+            logger.warning(f"[DEBUG] Failed to verify session state: {debug_error}")
         
     except Exception as e:
         logger.error(f"Error in stream_chat_response: {str(e)}")
@@ -1392,13 +1315,19 @@ async def execute_chat(request: ExecuteChatRequest):
 
         # Extract thread_id from full_session_id (remove prefix if present)
         # This ensures we use the correct session ID even if it was auto-created
-        thread_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
+        session_thread_id = full_session_id.replace("chat_session:", "") if full_session_id.startswith("chat_session:") else full_session_id
         
-        # Get current state (for conversation history)
+        # === [修復] 為每個新問題生成唯一的 internal_thread_id ===
+        # 這樣可以確保每個問題從乾淨狀態開始，避免 operator.add 字段的殘留問題
+        # session_thread_id 用於獲取消息歷史，internal_thread_id 用於 LangGraph 執行
+        internal_thread_id = f"{session_thread_id}_{uuid.uuid4().hex[:8]}"
+        logger.info(f"[STATE ISOLATION] session_thread_id={session_thread_id}, internal_thread_id={internal_thread_id}")
+        
+        # Get current state (for conversation history) - 使用 session_thread_id
         chat_graph = get_graph()
         current_state = await chat_graph.aget_state(
             config=RunnableConfig(
-                configurable={"thread_id": thread_id}
+                configurable={"thread_id": session_thread_id}
             )
         )
 
@@ -1441,11 +1370,11 @@ async def execute_chat(request: ExecuteChatRequest):
         }
 
         # Prepare config for graph execution
-        # Use thread_id (actual session ID without prefix)
+        # === [修復] 使用 internal_thread_id 確保每個問題從乾淨狀態開始 ===
         config_dict = {
             "recursion_limit": 100,
             "configurable": {
-                "thread_id": thread_id,
+                "thread_id": internal_thread_id,  # 使用隔離的 thread_id
                 "model_id": model_override,
             }
         }
@@ -1461,6 +1390,7 @@ async def execute_chat(request: ExecuteChatRequest):
                 graph_input=graph_input,
                 config_dict=config_dict,
                 actual_session_id=actual_session_id_for_stream,
+                session_thread_id=session_thread_id,  # 傳入 session_thread_id 用於保存最終答案
             ),
             media_type="text/event-stream",
             headers={

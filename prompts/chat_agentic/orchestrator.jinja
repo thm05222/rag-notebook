@@ -133,6 +133,20 @@ Assistant: {{turn.assistant}}
   * Verifying the same fact multiple times
   * Searching for information that clearly doesn't exist locally
 
+## 6. QUERY VARIATION (Mandatory for Repeated Searches)
+- **CRITICAL**: The system will BLOCK identical or very similar queries. You MUST vary your search terms!
+- If you need to search again after a previous search:
+  * **MUST use different keywords** (synonyms, rephrasings, related terms)
+  * Example: After searching "heat exchanger fouling resistance", try:
+    - "shell tube fouling mitigation design"
+    - "reduce fouling coefficient heat transfer"
+    - "anti-fouling heat exchanger strategies"
+  * **NEVER repeat the exact same query** - it will be blocked by the system
+- When switching from local to internet search, **reformulate your query**:
+  * Add context words like "design guide", "best practices", "industry standard"
+  * Use different technical terms or synonyms
+  * Break down complex queries into simpler, focused searches
+
 # TERMINATION CONDITIONS
 - Enough information gathered -> Action: "synthesize"
 - Multiple failed searches (including internet search) -> Action: "synthesize" (Refiner will state data is missing)
