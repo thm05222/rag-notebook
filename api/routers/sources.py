@@ -386,6 +386,9 @@ async def get_sources(
         return response_list
     except HTTPException:
         raise
+    except NotFoundError as e:
+        logger.warning(f"Notebook not found: {str(e)}")
+        raise HTTPException(status_code=404, detail=f"Notebook not found: {str(e)}")
     except Exception as e:
         logger.error(f"Error fetching sources: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching sources: {str(e)}")
@@ -652,6 +655,14 @@ async def create_source(
             except Exception:
                 pass
         raise
+    except NotFoundError as e:
+        # Clean up uploaded file on not found errors if we created it
+        if file_path and upload_file:
+            try:
+                os.unlink(file_path)
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail=str(e))
     except InvalidInputError as e:
         # Clean up uploaded file on validation errors if we created it
         if file_path and upload_file:
@@ -752,6 +763,8 @@ async def build_pageindex_for_source(source_id: str):
             
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error building PageIndex for source {source_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -759,8 +772,6 @@ async def build_pageindex_for_source(source_id: str):
 
 async def _resolve_source_file(source_id: str) -> tuple[str, str]:
     source = await Source.get(source_id)
-    if not source:
-        raise HTTPException(status_code=404, detail="Source not found")
 
     file_path = source.asset.file_path if source.asset else None
     if not file_path:
@@ -874,6 +885,8 @@ async def check_source_file(source_id: str):
         return Response(status_code=200)
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error checking file for source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to verify file")
@@ -891,6 +904,8 @@ async def download_source_file(source_id: str):
         )
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error downloading file for source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to download source file")
@@ -951,6 +966,8 @@ async def get_source_status(source_id: str):
 
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error fetching status for source {source_id}: {str(e)}")
         raise HTTPException(
@@ -995,6 +1012,8 @@ async def update_source(source_id: str, source_update: SourceUpdate):
         )
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except InvalidInputError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1124,6 +1143,8 @@ async def retry_source_processing(source_id: str):
 
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error retrying source processing for {source_id}: {str(e)}")
         raise HTTPException(
@@ -1204,6 +1225,8 @@ async def delete_source(source_id: str):
         return {"message": "Source deleted successfully"}
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error deleting source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error deleting source: {str(e)}")
@@ -1231,6 +1254,8 @@ async def get_source_insights(source_id: str):
         ]
     except HTTPException:
         raise
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
     except Exception as e:
         logger.error(f"Error fetching insights for source {source_id}: {str(e)}")
         raise HTTPException(
@@ -1276,6 +1301,8 @@ async def create_source_insight(source_id: str, request: CreateSourceInsightRequ
 
     except HTTPException:
         raise
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error creating insight for source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error creating insight: {str(e)}")

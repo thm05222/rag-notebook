@@ -968,12 +968,12 @@ Directly return the final JSON structure. Do not output anything else."""
                             f"Consider using vector_search as an alternative."
                         )
                     else:
-                    error_summary = "; ".join([f"{fs['source_id']}: {fs['error']}" for fs in failed_sources[:3]])
-                    raise ToolExecutionError(
-                        f"All {len(sources)} sources failed to search. "
-                        f"First few errors: {error_summary}. "
-                        f"Please check if sources have content and PageIndex structures are built."
-                    )
+                        error_summary = "; ".join([f"{fs['source_id']}: {fs['error']}" for fs in failed_sources[:3]])
+                        raise ToolExecutionError(
+                            f"All {len(sources)} sources failed to search. "
+                            f"First few errors: {error_summary}. "
+                            f"Please check if sources have content and PageIndex structures are built."
+                        )
 
             elif source_ids:
                 # 方式 3: 搜索指定的 sources（只使用已存在的 PageIndex，不自動建立）
@@ -1027,12 +1027,12 @@ Directly return the final JSON structure. Do not output anything else."""
                             f"Consider using vector_search as an alternative."
                         )
                     else:
-                    error_summary = "; ".join([f"{fs['source_id']}: {fs['error']}" for fs in failed_sources[:3]])
-                    raise ToolExecutionError(
-                        f"All {len(source_ids)} sources failed to search. "
-                        f"First few errors: {error_summary}. "
-                        f"Please check if sources exist and have content."
-                    )
+                        error_summary = "; ".join([f"{fs['source_id']}: {fs['error']}" for fs in failed_sources[:3]])
+                        raise ToolExecutionError(
+                            f"All {len(source_ids)} sources failed to search. "
+                            f"First few errors: {error_summary}. "
+                            f"Please check if sources exist and have content."
+                        )
             else:
                 raise ValueError("Must provide document_path, notebook_id, or source_ids")
 
