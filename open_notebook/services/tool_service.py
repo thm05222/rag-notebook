@@ -290,9 +290,13 @@ class CalculationParameters(BaseModel):
 
 
 class InternetSearchParameters(BaseModel):
-    """Parameters for internet search tool."""
-    query: str = Field(..., description="Search query")
-    limit: int = Field(default=10, ge=1, description="Maximum number of results")
+    """Parameters for internet search tool using SearXNG."""
+    query: str = Field(..., description="The search query string.")
+    limit: int = Field(default=10, ge=1, description="Maximum number of results to return.")
+    categories: Optional[str] = Field(
+        default="general",
+        description="Search category. Options: 'general' (default web), 'news' (current events), 'science' (academic papers/standards like TEMA/ISO), 'it' (programming/GitHub), 'files' (documents/PDFs)."
+    )
 
 
 # Built-in tools
@@ -427,45 +431,61 @@ class TextSearchTool(BaseTool):
 
 
 class InternetSearchTool(BaseTool):
-    """Internet search tool using DuckDuckGo."""
+    """Internet search tool using SearXNG (aggregates Google, Bing, DuckDuckGo, ArXiv, GitHub)."""
 
     def __init__(self):
         super().__init__(
             name="internet_search",
-            description="Search the internet for current information, news, or information not available in the local knowledge base. "
-            "Use this when you need up-to-date information, external resources, or information beyond the documents in the workspace.",
+            description="Search the internet using SearXNG (aggregates Google, Bing, DuckDuckGo, ArXiv, GitHub). "
+            "Use 'categories' parameter to focus search: 'science' for academic papers/standards (TEMA/ISO), "
+            "'news' for current events, 'it' for code/repos, 'general' for everything else.",
             timeout=30.0,
             parameter_model=InternetSearchParameters,
         )
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
-        """Execute internet search using DuckDuckGo."""
-        try:
-            from duckduckgo_search import DDGS
-        except ImportError:
-            raise ToolExecutionError(
-                "duckduckgo-search library is not installed. "
-                "Please install it with: pip install duckduckgo-search"
-            )
+        """Execute internet search using SearXNG."""
+        import os
+        import aiohttp
 
         query = kwargs.get("query", "")
         limit = kwargs.get("limit", 10)
+        categories = kwargs.get("categories", "general")
+
+        # Get SearXNG URL from environment variable
+        searxng_url = os.getenv("SEARXNG_URL", "http://searxng:8080/search")
 
         try:
-            # Execute search with region set to 'wt-wt' for worldwide results
-            # Note: 'region' is now passed to text() method, not DDGS() constructor
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, region='wt-wt', max_results=limit))
+            # Build request parameters
+            params = {
+                "q": query,
+                "format": "json",
+                "categories": categories,
+            }
+
+            # Execute search with timeout
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(searxng_url, params=params) as resp:
+                    if resp.status != 200:
+                        raise ToolExecutionError(f"SearXNG returned status {resp.status}")
+                    data = await resp.json()
+
+            # Extract results
+            raw_results = data.get("results", [])[:limit]
 
             # Format results to match other search tools
             formatted_results = []
-            for result in results:
+            for result in raw_results:
+                url = result.get("url", "")
                 formatted_results.append({
-                    "id": f"internet_search:{hash(result.get('href', ''))}",
+                    "id": f"internet_search:{hash(url)}",
                     "title": result.get("title", ""),
-                    "content": result.get("body", ""),
-                    "url": result.get("href", ""),
+                    "content": result.get("content", "") or result.get("snippet", ""),
+                    "url": url,
                     "source": "internet_search",
+                    "engine": result.get("engine", ""),
+                    "category": categories,
                     "similarity": 1.0,  # Internet search doesn't have similarity scores
                 })
 
@@ -479,10 +499,31 @@ class InternetSearchTool(BaseTool):
                     "result_count": len(formatted_results),
                     "query": query,
                     "search_type": "internet",
+                    "categories": categories,
+                    "searxng_url": searxng_url,
                 },
             }
+        except aiohttp.ClientError as e:
+            error_msg = f"SearXNG connection error: {str(e)}"
+            logger.error(f"{self.name} failed: {error_msg}")
+            return {
+                "tool_name": self.name,
+                "success": False,
+                "data": [],
+                "error": error_msg,
+                "execution_time": 0.0,
+                "metadata": {
+                    "error_type": type(e).__name__,
+                    "error_message": error_msg,
+                    "query": query,
+                    "categories": categories,
+                },
+                "error_details": {
+                    "reason": "SearXNG 連線失敗",
+                    "suggestion": "請檢查 SearXNG 服務是否正常運行，或嘗試其他工具",
+                }
+            }
         except Exception as e:
-            # 不 raise，而是返回錯誤結果
             error_msg = str(e)
             logger.error(f"{self.name} failed: {error_msg}")
             return {
@@ -495,6 +536,7 @@ class InternetSearchTool(BaseTool):
                     "error_type": type(e).__name__,
                     "error_message": error_msg,
                     "query": query,
+                    "categories": categories,
                 },
                 "error_details": {
                     "reason": "工具執行失敗",
@@ -545,15 +587,91 @@ class MCPToolWrapper(BaseTool):
                 self.server_name, self.actual_tool_name, kwargs
             )
 
+            # === [調試] 記錄 MCP 返回的原始結果 ===
+            logger.info(f"[MCP DEBUG] {self.name}: Raw result type = {type(result)}")
+            logger.info(f"[MCP DEBUG] {self.name}: Raw result = {str(result)[:500]}...")
+            
+            # === [修復] 檢查 MCP 是否返回錯誤 ===
+            is_error = getattr(result, 'isError', False)
+            if is_error:
+                # 提取錯誤信息
+                error_msg = "MCP tool returned an error"
+                if hasattr(result, 'content') and result.content:
+                    for item in result.content:
+                        if hasattr(item, 'text'):
+                            error_msg = item.text
+                            break
+                logger.warning(f"[MCP DEBUG] {self.name}: Tool returned isError=True: {error_msg}")
+                return {
+                    "tool_name": self.name,
+                    "success": False,
+                    "data": [],
+                    "error": error_msg,
+                    "execution_time": 0.0,
+                    "metadata": {
+                        "server": self.server_name,
+                        "mcp_tool": self.actual_tool_name,
+                        "is_mcp_error": True,
+                    },
+                }
+            
+            if hasattr(result, 'content'):
+                logger.info(f"[MCP DEBUG] {self.name}: Content length = {len(result.content)}")
+                for i, item in enumerate(result.content[:3]):
+                    logger.info(f"[MCP DEBUG] {self.name}: Content[{i}] type = {type(item)}, has text = {hasattr(item, 'text')}")
+                    if hasattr(item, 'text'):
+                        logger.info(f"[MCP DEBUG] {self.name}: Content[{i}].text length = {len(item.text)}, preview = {item.text[:200]}...")
+
+            # === [修復] 將 MCP CallToolResult 轉換為統一格式 ===
+            # MCP 返回的是 CallToolResult 對象，需要提取其內容
+            formatted_data = []
+            if result is not None:
+                # CallToolResult 有 content 屬性，包含 TextContent 或其他類型
+                if hasattr(result, 'content'):
+                    for item in result.content:
+                        if hasattr(item, 'text'):
+                            # TextContent
+                            formatted_data.append({
+                                "id": f"mcp_{self.server_name}_{self.actual_tool_name}_{hash(item.text) % 10000}",
+                                "type": "mcp_result",
+                                "title": f"{self.actual_tool_name} result",
+                                "content": item.text,
+                                "source": f"mcp::{self.server_name}",
+                            })
+                        elif hasattr(item, 'data'):
+                            # BlobContent or other
+                            formatted_data.append({
+                                "id": f"mcp_{self.server_name}_{self.actual_tool_name}_{hash(str(item.data)) % 10000}",
+                                "type": "mcp_result",
+                                "title": f"{self.actual_tool_name} result",
+                                "content": str(item.data),
+                                "source": f"mcp::{self.server_name}",
+                            })
+                else:
+                    # Fallback: 直接將結果轉為字串
+                    formatted_data.append({
+                        "id": f"mcp_{self.server_name}_{self.actual_tool_name}",
+                        "type": "mcp_result",
+                        "title": f"{self.actual_tool_name} result",
+                        "content": str(result),
+                        "source": f"mcp::{self.server_name}",
+                    })
+            
+            # === [調試] 記錄格式化後的結果 ===
+            logger.info(f"[MCP DEBUG] {self.name}: Formatted data count = {len(formatted_data)}")
+            for i, d in enumerate(formatted_data[:3]):
+                logger.info(f"[MCP DEBUG] {self.name}: Formatted[{i}] content length = {len(d.get('content', ''))}")
+
             return {
                 "tool_name": self.name,
                 "success": True,
-                "data": result,
+                "data": formatted_data,
                 "error": None,
                 "execution_time": 0.0,
                 "metadata": {
                     "server": self.server_name,
                     "mcp_tool": self.actual_tool_name,
+                    "result_count": len(formatted_data),
                 },
             }
         except Exception as e:

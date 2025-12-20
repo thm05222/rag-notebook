@@ -51,6 +51,10 @@ Assistant: {{turn.assistant}}
 
 {% for tool in available_tools %}
 - **{{tool.name}}**{% if tool.category %} [{{tool.category}}]{% endif %}: {{tool.description}}
+{% if tool.parameters and tool.parameters.properties %}
+  Parameters: {% for param_name, param_info in tool.parameters.properties.items() %}
+    - `{{param_name}}`{% if param_name in (tool.parameters.required or []) %} (required){% endif %}: {{param_info.description|default(param_info.type|default('any'))}}{% endfor %}
+{% endif %}
 {% if tool.special_note %}  {{tool.special_note}}{% endif %}
 {% endfor %}
 
@@ -88,11 +92,19 @@ Assistant: {{turn.assistant}}
    - Best for: General concepts, finding snippets across multiple sources.
 
 3. **Internet Search (`internet_search`)** - **CRITICAL FOR DATA INSUFFICIENCY**:
+   - Powered by SearXNG (aggregates Google, Bing, DuckDuckGo, ArXiv, GitHub)
    - **MUST USE** when local searches return empty or insufficient results.
    - **MUST USE** when `refinement_feedback` suggests missing information.
-   - External knowledge, fact verification, real-time info.
-   - Combine with internal search for comprehensive answers.
-   - Use when: Internal docs are incomplete, need public context, real-time data.
+   - **Categories Guidelines** (IMPORTANT - choose wisely for better results):
+     * Use `science` when the user asks for academic papers, standards (ISO/TEMA/ASME), or research.
+     * Use `it` for programming libraries (Python/Rust) or GitHub repositories.
+     * Use `news` for current events, market trends, or recent developments.
+     * Use `general` for everything else (default).
+   - **Usage Examples**:
+     * Technical standards: `{"query": "TEMA shell tube heat exchanger design", "categories": "science"}`
+     * Academic research: `{"query": "fouling resistance research", "categories": "science"}`
+     * News/trends: `{"query": "heat exchanger market 2024", "categories": "news"}`
+     * Code/libraries: `{"query": "python heat transfer library", "categories": "it"}`
    - **Do not hesitate** to use this tool when local knowledge is insufficient.
 
 4. **Text Search (`text_search`)**:

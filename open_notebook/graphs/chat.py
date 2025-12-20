@@ -2525,6 +2525,7 @@ async def synthesize_answer(
                 f"[Iteration {iteration}] synthesize_answer: Evaluation rejected but near iteration limit, forcing final_answer"
             )
             # 關鍵修復：將最終答案添加到 messages 狀態中
+            from langchain_core.messages import AIMessage
             ai_message = AIMessage(content=answer)
             return {
                 "messages": [ai_message],  # [新增] 這一行至關重要，將回答寫入對話歷史
