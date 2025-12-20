@@ -1224,15 +1224,18 @@ async def stream_chat_response(
                     user_question = request.message if request else None
                     
                     # 需要同時保存 HumanMessage 和 AIMessage
-                    # 檢查是否已經有這個問題的 HumanMessage
-                    human_message_exists = any(
-                        (hasattr(msg, 'type') and msg.type == 'human') and 
-                        (hasattr(msg, 'content') and msg.content and user_question and msg.content[:50] == user_question[:50])
-                        for msg in session_messages
+                    # 修復：每次對話都應該完整記錄問答對
+                    # 之前的邏輯會跳過重複問題的 HumanMessage，導致對話歷史不完整
+                    # 現在改為：檢查最後一條消息是否就是這個問題（避免同一請求重複保存）
+                    last_message = session_messages[-1] if session_messages else None
+                    is_duplicate_request = (
+                        last_message and 
+                        hasattr(last_message, 'type') and last_message.type == 'human' and
+                        hasattr(last_message, 'content') and last_message.content == user_question
                     )
                     
                     messages_to_add = []
-                    if not human_message_exists and user_question:
+                    if not is_duplicate_request and user_question:
                         messages_to_add.append(HumanMessage(content=user_question))
                     messages_to_add.append(AIMessage(content=final_answer))
                     

@@ -492,40 +492,47 @@ class QdrantService:
         Args:
             source_id: Source ID
         """
-        await self._ensure_collections()
+        # Don't call _ensure_collections() here - delete doesn't need vector dimension
+        # and should work even without an embedding model configured
         client = await self._ensure_client()
         
         @qdrant_retry
         def _delete_embeddings():
-            # Delete from source_embeddings collection
-            client.delete(
-                collection_name="source_embeddings",
-                points_selector=models.FilterSelector(
-                    filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="source_id",
-                                match=models.MatchValue(value=source_id)
-                            )
-                        ]
-                    )
-                )
-            )
+            # Get existing collections to avoid errors on non-existent collections
+            collections_info = client.get_collections()
+            existing_collections = [c.name for c in collections_info.collections]
             
-            # Delete from source_insights collection
-            client.delete(
-                collection_name="source_insights",
-                points_selector=models.FilterSelector(
-                    filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="source_id",
-                                match=models.MatchValue(value=source_id)
-                            )
-                        ]
+            # Delete from source_embeddings collection if it exists
+            if "source_embeddings" in existing_collections:
+                client.delete(
+                    collection_name="source_embeddings",
+                    points_selector=models.FilterSelector(
+                        filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="source_id",
+                                    match=models.MatchValue(value=source_id)
+                                )
+                            ]
+                        )
                     )
                 )
-            )
+            
+            # Delete from source_insights collection if it exists
+            if "source_insights" in existing_collections:
+                client.delete(
+                    collection_name="source_insights",
+                    points_selector=models.FilterSelector(
+                        filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="source_id",
+                                    match=models.MatchValue(value=source_id)
+                                )
+                            ]
+                        )
+                    )
+                )
         
         try:
             await asyncio.to_thread(_delete_embeddings)

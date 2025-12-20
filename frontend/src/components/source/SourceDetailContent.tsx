@@ -93,6 +93,7 @@ export function SourceDetailContent({
   const fetchSource = useCallback(async () => {
     try {
       setLoading(true)
+      setError(null)
       const data = await sourcesApi.get(sourceId)
       setSource(data)
       if (typeof data.file_available === 'boolean') {
@@ -103,8 +104,14 @@ export function SourceDetailContent({
         setFileAvailable(null)
       }
     } catch (err) {
-      console.error('Failed to fetch source:', err)
-      setError('Failed to load source details')
+      // Handle 404 errors gracefully - source may have been deleted or ID is invalid
+      if (isAxiosError(err) && err.response?.status === 404) {
+        setError(`Source not found. This source may have been deleted or the reference is invalid.`)
+        console.warn(`Source ${sourceId} not found (404)`)
+      } else {
+        console.error('Failed to fetch source:', err)
+        setError('Failed to load source details')
+      }
     } finally {
       setLoading(false)
     }

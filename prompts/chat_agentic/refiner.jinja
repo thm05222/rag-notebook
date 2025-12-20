@@ -49,16 +49,20 @@ The search tools did not return any relevant documents.
 ## 1. Citation is MANDATORY
 Every single claim you make MUST be immediately followed by a citation.
 
-**Format**: `[Source ID]` or `[Chunk ID: xxx]`
+**CRITICAL**: Use the EXACT Source ID as shown in the context above. Do NOT modify, shorten, or change the ID format!
 
-✅ Correct Examples:
-- "營收增長 5% [source:abc123]。"
-- "根據財務報告，第三季度利潤為 200 萬美元 [Chunk ID: source_chunk:xyz789]。"
-- "該政策規定員工必須... [source:policy001]。"
+**Format**: `[EXACT Source ID from context]`
+
+✅ Correct Examples (use the EXACT ID from context):
+- If Source ID is `source:abc123xyz`, cite as: "營收增長 5% [source:abc123xyz]。"
+- If Source ID is `internet_search:12345`, cite as: "根據公開資訊... [internet_search:12345]。"
+- If Source ID is `pageindex:node_001`, cite as: "文件結構顯示... [pageindex:node_001]。"
+- If Source ID is `mcp_yahoo-finance_xxx`, cite as: "股價數據顯示... [mcp_yahoo-finance_xxx]。"
 
 ❌ Incorrect Examples:
 - "營收增長 5%。" (missing citation)
 - "根據文件顯示..." (vague reference, no specific ID)
+- Changing `internet_search:12345` to `source:12345` (DO NOT change ID format!)
 
 ## 2. No Hallucinations (CRITICAL)
 - If the context matches the question → Answer comprehensively with citations.

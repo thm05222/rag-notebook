@@ -2696,8 +2696,27 @@ def should_accept_answer(state: ChatAgenticState) -> str:
                 )
                 return "accept"
 
-    # 關鍵修復：當有 collected_results 且 iteration_count >= 3 時，即使沒有 final_answer，也應該接受 partial_answer
+    # 關鍵修復：先檢查幻覺風險，再決定是否接受
+    # 將幻覺檢測移到最前面，防止高風險答案被直接接受
     collected_results = state.get("collected_results", [])
+    hallucination_check = state.get("hallucination_check")
+    if hallucination_check and hallucination_check.get("has_hallucination_risk"):
+        risk_score = hallucination_check.get("hallucination_risk_score", 0.0)
+        invalid_citations = hallucination_check.get("invalid_citations", [])
+        
+        # 如果風險很高（> 0.7）且有無效引用，拒絕答案（除非接近迭代限制）
+        if risk_score > 0.7 and len(invalid_citations) > 0:
+            if iteration < max_iterations - 1:
+                logger.warning(
+                    f"[Iteration {iteration}] should_accept_answer: High hallucination risk ({risk_score:.2f}) with {len(invalid_citations)} invalid citations, rejecting"
+                )
+                return "reject"
+            else:
+                logger.warning(
+                    f"[Iteration {iteration}] should_accept_answer: High hallucination risk but at iteration limit, accepting with warning"
+                )
+    
+    # 當有 collected_results 且 iteration_count >= 3 時，接受 partial_answer（但幻覺檢測已在上面處理）
     if iteration >= 3 and len(collected_results) > 0:
         if state.get("partial_answer"):
             logger.info(
@@ -2755,21 +2774,7 @@ def should_accept_answer(state: ChatAgenticState) -> str:
             )
             return "accept"
 
-    # 檢查 hallucination 風險
-    hallucination_check = state.get("hallucination_check")
-    if hallucination_check and hallucination_check.get("has_hallucination_risk"):
-        risk_score = hallucination_check.get("hallucination_risk_score", 0.0)
-        if risk_score > 0.6:
-            # 如果已經接近最大迭代次數，即使風險高也要接受
-            if iteration >= max_iterations - 1:
-                logger.warning(
-                    f"[Iteration {iteration}] should_accept_answer: High hallucination risk but near limit, accepting"
-                )
-                return "accept"
-            logger.info(
-                f"[Iteration {iteration}] should_accept_answer: High hallucination risk ({risk_score:.2f}), rejecting"
-            )
-            return "reject"  # 高風險，拒絕
+    # 幻覺檢測已在函數開頭處理，這裡不再重複
 
     # 關鍵調整：降低標準接受條件的閾值（從 0.7 降低到 0.5）
     # 允許更多中等質量的答案被接受，減少不必要的拒絕

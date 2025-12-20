@@ -23,7 +23,15 @@ Recent conversation context:
 Based on multiple searches, you have collected the following information:
 
 {% if collected_results %}
+{% set valid_results = [] %}
 {% for result in collected_results %}
+{% if result.id and (result.content or (result.matches and result.matches|length > 0)) %}
+{% set _ = valid_results.append(result) %}
+{% endif %}
+{% endfor %}
+
+{% if valid_results|length > 0 %}
+{% for result in valid_results %}
 ## Source: {{result.title or result.id}} {% if result.id %}[{{result.id}}]{% endif %}
 
 {% if result.content %}
@@ -47,7 +55,20 @@ No content available for this source.
 
 {% endfor %}
 {% else %}
-No information collected. Please search first before synthesizing.
+**WARNING: No valid search results were collected. All search tools failed or returned empty results.**
+
+The search tools encountered errors or returned no valid information. You should answer based on your general knowledge, but:
+- **DO NOT make up or fabricate source IDs**
+- **DO NOT include citations** if you don't have valid sources
+- Clearly state that you're answering based on general knowledge, not from the workspace documents
+{% endif %}
+{% else %}
+**WARNING: No information collected. All search tools failed or returned no results.**
+
+You should answer based on your general knowledge, but:
+- **DO NOT make up or fabricate source IDs**
+- **DO NOT include citations** if you don't have valid sources
+- Clearly state that you're answering based on general knowledge, not from the workspace documents
 {% endif %}
 
 # YOUR JOB
@@ -58,18 +79,31 @@ Synthesize a comprehensive, accurate answer to the user's question based on the 
 
 1. **Accuracy**: ONLY use information from the collected sources. Do NOT make up information.
 2. **Completeness**: Address all aspects of the question
-3. **Citations**: Cite sources using format [document_id] for each claim
+3. **Citations**: 
+   - **ONLY cite sources that exist in the collected results above**
+   - Use format [document_id] for each claim
+   - **If no valid sources were collected (all searches failed), DO NOT include any citations**
+   - **NEVER make up or fabricate source IDs**
 4. **Structure**: Organize the answer clearly with proper formatting
 5. **Clarity**: Write in a clear, understandable manner
 6. **No Hallucinations**: Do NOT include any information that is not in the collected sources
+7. **When Search Fails**: If search tools failed or returned no results, answer based on your general knowledge but explicitly state this and do NOT include citations
 
 # CITING INSTRUCTIONS
 
+**CRITICAL RULES:**
+- **ONLY cite sources that are listed in the "COLLECTED INFORMATION" section above**
 - Use format [document_id] immediately after each claim or statement
-- Only cite sources that are in the collected results
-- Do NOT make up document IDs
+- **NEVER make up, fabricate, or invent document IDs**
+- **If no valid sources were collected (all searches failed), DO NOT include ANY citations**
 - Use the exact ID format as provided (e.g., "source:abc123", "source_insight:xyz789")
 - If a source has a URL, you can also reference it: [document_id](url)
+
+**When Search Tools Fail:**
+- If you see "WARNING: No valid search results" or "No information collected" above
+- Answer based on your general knowledge
+- **DO NOT include citations** - state clearly that you're using general knowledge
+- Example: "Based on general knowledge (the search tools were unable to retrieve information from your workspace), [your answer here]. Note: This information is not from your workspace documents."
 
 # HALLUCINATION PREVENTION
 

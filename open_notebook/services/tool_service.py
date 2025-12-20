@@ -476,10 +476,18 @@ class InternetSearchTool(BaseTool):
 
             # Format results to match other search tools
             formatted_results = []
-            for result in raw_results:
+            for idx, result in enumerate(raw_results):
                 url = result.get("url", "")
+                # Generate a readable ID using domain + index (avoid hash numbers that LLM might confuse)
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).netloc.replace("www.", "")[:20]  # Get domain, max 20 chars
+                    result_id = f"web:{domain}_{idx}"
+                except Exception:
+                    result_id = f"web:result_{idx}"
+                
                 formatted_results.append({
-                    "id": f"internet_search:{hash(url)}",
+                    "id": result_id,
                     "title": result.get("title", ""),
                     "content": result.get("content", "") or result.get("snippet", ""),
                     "url": url,
