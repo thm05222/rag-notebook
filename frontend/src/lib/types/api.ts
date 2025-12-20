@@ -115,11 +115,19 @@ export interface SourceChatSession extends BaseChatSession {
   model_override?: string
 }
 
+export interface TokenUsage {
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+}
+
 export interface AgentThinkingStep {
   step_type: 'decision' | 'tool_call' | 'search' | 'evaluation' | 'refinement' | 'synthesis'
   timestamp: number
   content: string
-  metadata?: Record<string, unknown>
+  metadata?: Record<string, unknown> & {
+    token_usage?: TokenUsage
+  }
 }
 
 export interface AgentThinkingProcess {

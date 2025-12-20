@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -200,6 +200,14 @@ export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }:
   // 使用優化後的步驟
   const optimizedSteps = optimizeSteps(thinkingProcess.steps)
 
+  // 計算累積總量的 Helper
+  const totalSessionTokens = useMemo(() => {
+    return optimizedSteps.reduce(
+      (acc, step) => acc + (step.metadata?.token_usage?.total_tokens || 0), 
+      0
+    )
+  }, [optimizedSteps])
+
   console.log('[ThinkingProcessDisplay] Rendering Collapsible with isOpen:', isOpen)
 
   return (
@@ -244,6 +252,9 @@ export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }:
               </Button>
             </div>
             <div className="flex flex-wrap gap-2 mt-2 text-xs text-muted-foreground">
+              {totalSessionTokens > 0 && (
+                <span className="font-medium">Tokens: {totalSessionTokens.toLocaleString()}</span>
+              )}
               {thinkingProcess.total_tool_calls > 0 && (
                 <span>Tools: {thinkingProcess.total_tool_calls}</span>
               )}
@@ -291,8 +302,21 @@ export function ThinkingProcessDisplay({ thinkingProcess, defaultOpen = false }:
                       <span className="text-xs text-muted-foreground">
                         {formatTimestamp(step.timestamp)}
                       </span>
+                      {/* Token Badge */}
+                      {step.metadata?.token_usage?.total_tokens && step.metadata.token_usage.total_tokens > 0 && (
+                        <span className="text-[10px] bg-muted px-1.5 py-0.5 rounded text-muted-foreground whitespace-nowrap">
+                          {step.metadata.token_usage.total_tokens.toLocaleString()} tok
+                        </span>
+                      )}
                     </div>
                     <p className="text-sm">{step.content}</p>
+                    {/* Token Details (展開時顯示) */}
+                    {showDetails && step.metadata?.token_usage && (
+                      <div className="mt-1 text-[10px] text-muted-foreground grid grid-cols-2 gap-x-4 w-fit bg-muted/50 p-1.5 rounded">
+                        <span>Input: {step.metadata.token_usage.input_tokens?.toLocaleString() || 0}</span>
+                        <span>Output: {step.metadata.token_usage.output_tokens?.toLocaleString() || 0}</span>
+                      </div>
+                    )}
                     {showDetails && step.metadata && (
                       <div className="mt-2 p-2 bg-muted rounded text-xs">
                         <pre className="whitespace-pre-wrap break-words">

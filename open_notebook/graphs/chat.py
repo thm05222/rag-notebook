@@ -814,9 +814,19 @@ async def agent_decision(
         api_error = None
         response = None
         
+        # Token usage tracking for this decision
+        decision_token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        
         for api_attempt in range(max_api_retries):
             try:
                 response = await model.ainvoke(messages_payload)
+                # 提取 token usage
+                usage = getattr(response, "usage_metadata", {}) or {}
+                decision_token_usage = {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0)
+                }
                 break  # 成功則跳出重試循環
             except Exception as api_e:
                 api_error = api_e
@@ -885,6 +895,11 @@ async def agent_decision(
                         f"[Iteration {iteration}] Retrying decision generation with parse error feedback..."
                     )
                     response = await model.ainvoke(messages_payload)
+                    # 更新 token usage（累加重試的 tokens）
+                    usage = getattr(response, "usage_metadata", {}) or {}
+                    decision_token_usage["input_tokens"] += usage.get("input_tokens", 0)
+                    decision_token_usage["output_tokens"] += usage.get("output_tokens", 0)
+                    decision_token_usage["total_tokens"] += usage.get("total_tokens", 0)
                     content = (
                         response.content
                         if isinstance(response.content, str)
@@ -1016,11 +1031,14 @@ async def agent_decision(
         elif decision.action in ["synthesize", "evaluate", "finish"]:
             decision_entry = decision.action
         
+        # 將 token 資訊嵌入 reasoning_trace
+        reasoning_with_tokens = f"{decision.reasoning} |tokens:{decision_token_usage['total_tokens']}|in:{decision_token_usage['input_tokens']}|out:{decision_token_usage['output_tokens']}"
+        
         result = {
             "decision_history": [decision_entry],  # 記錄 action:tool_name 格式，LangGraph 會自動累積
             "reasoning_trace": [
-                decision.reasoning
-            ],  # 只返回新元素，LangGraph 會自動累積
+                reasoning_with_tokens
+            ],  # 只返回新元素，LangGraph 會自動累積，包含 token 資訊
             "token_count": new_token_count,
             "current_decision": current_decision_dict,  # 關鍵修復：設置 current_decision
         }
@@ -2112,6 +2130,13 @@ async def refine_query(
         )
 
         response = await model.ainvoke(messages_payload)
+        # 提取 token usage
+        usage = getattr(response, "usage_metadata", {}) or {}
+        refine_token_usage = {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0)
+        }
         content = (
             response.content
             if isinstance(response.content, str)
@@ -2121,6 +2146,9 @@ async def refine_query(
 
         refined_decision = parser.parse(cleaned_content)
 
+        # 將 token 資訊嵌入 reasoning_trace
+        reasoning_with_tokens = f"Refined query: {refined_decision.reasoning} |tokens:{refine_token_usage['total_tokens']}|in:{refine_token_usage['input_tokens']}|out:{refine_token_usage['output_tokens']}"
+
         return {
             "current_decision": {
                 "action": "use_tool",
@@ -2128,13 +2156,13 @@ async def refine_query(
                 "parameters": refined_decision.parameters or {},
                 "reasoning": refined_decision.reasoning,
             },
-            "reasoning_trace": [f"Refined query: {refined_decision.reasoning}"],
+            "reasoning_trace": [reasoning_with_tokens],
         }
     except Exception as e:
         logger.error(f"Error refining query: {e}")
         return {
             "current_decision": {"action": "evaluate"},
-            "reasoning_trace": [f"Query refinement failed: {str(e)}"],
+            "reasoning_trace": [f"Query refinement failed: {str(e)} |tokens:0|in:0|out:0"],
         }
 
 
@@ -2297,6 +2325,9 @@ async def synthesize_answer(
             f"[Iteration {iteration}] synthesize_answer: Prompt length: {len(system_content)} chars"
         )
 
+        # Token usage tracking for synthesis
+        synthesis_token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        
         # 關鍵修復：添加超時和更詳細的錯誤處理
         try:
             import asyncio
@@ -2304,7 +2335,14 @@ async def synthesize_answer(
                 model.ainvoke(messages_payload),
                 timeout=120.0  # 2 分鐘超時
             )
-            logger.info(f"[Iteration {iteration}] synthesize_answer: LLM invoke completed successfully")
+            # 提取 token usage
+            usage = getattr(response, "usage_metadata", {}) or {}
+            synthesis_token_usage = {
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0)
+            }
+            logger.info(f"[Iteration {iteration}] synthesize_answer: LLM invoke completed successfully, tokens: {synthesis_token_usage}")
         except asyncio.TimeoutError:
             logger.error(f"[Iteration {iteration}] synthesize_answer: LLM invoke timed out after 120 seconds")
             raise TimeoutError("LLM response timeout after 120 seconds")
@@ -2496,7 +2534,7 @@ async def synthesize_answer(
                 "evaluation_result": eval_result,
                 "iteration_count": state["iteration_count"] + 1,
                 "reasoning_trace": [
-                    f"Generated answer rejected by evaluation but forced acceptance due to iteration limit",
+                    f"Generated answer rejected by evaluation but forced acceptance due to iteration limit |tokens:{synthesis_token_usage['total_tokens']}|in:{synthesis_token_usage['input_tokens']}|out:{synthesis_token_usage['output_tokens']}",
                     f"Quality score: {combined_score:.2f}, hallucination risk: {risk_score:.2f}",
                 ],
             }
@@ -2519,7 +2557,7 @@ async def synthesize_answer(
                 "iteration_count": state["iteration_count"] + 1,
                 "reasoning_trace": [
                     f"Generated answer with quality score: {combined_score:.2f}, "
-                    f"hallucination risk: {risk_score:.2f} (accepted despite rejection due to reasonable score)"
+                    f"hallucination risk: {risk_score:.2f} (accepted despite rejection due to reasonable score) |tokens:{synthesis_token_usage['total_tokens']}|in:{synthesis_token_usage['input_tokens']}|out:{synthesis_token_usage['output_tokens']}"
                 ],
             }
         
@@ -2559,7 +2597,7 @@ async def synthesize_answer(
                 "refinement_feedback": refinement_feedback,  # 添加 feedback
                 "iteration_count": state["iteration_count"] + 1,
                 "reasoning_trace": [
-                    f"Generated answer rejected: quality score {combined_score:.2f}, hallucination risk {risk_score:.2f}",
+                    f"Generated answer rejected: quality score {combined_score:.2f}, hallucination risk {risk_score:.2f} |tokens:{synthesis_token_usage['total_tokens']}|in:{synthesis_token_usage['input_tokens']}|out:{synthesis_token_usage['output_tokens']}",
                     f"Feedback generated for Orchestrator: {refinement_feedback['reason']}",
                 ],
             }
@@ -2584,7 +2622,7 @@ async def synthesize_answer(
             "iteration_count": state["iteration_count"] + 1,
             "reasoning_trace": [
                 f"Generated answer with quality score: {combined_score:.2f}, "
-                f"hallucination risk: {risk_score:.2f}"
+                f"hallucination risk: {risk_score:.2f} |tokens:{synthesis_token_usage['total_tokens']}|in:{synthesis_token_usage['input_tokens']}|out:{synthesis_token_usage['output_tokens']}"
             ],
         }
     except Exception as e:

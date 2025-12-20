@@ -662,6 +662,49 @@ def generate_simple_fallback(
     return fallback_text
 
 
+def parse_token_from_trace(trace: str) -> tuple:
+    """解析 reasoning_trace 中的 token 資訊
+    
+    Args:
+        trace: 包含 token 資訊的 reasoning_trace 字串
+               格式: "content |tokens:1234|in:800|out:434"
+    
+    Returns:
+        tuple: (content, token_usage) 其中 token_usage 是 dict 或 None
+    """
+    import re
+    
+    if not isinstance(trace, str):
+        return str(trace), None
+    
+    # 匹配 |tokens:xxx|in:xxx|out:xxx 格式
+    token_pattern = r'\s*\|tokens:(\d+)\|in:(\d+)\|out:(\d+)\s*$'
+    match = re.search(token_pattern, trace)
+    
+    if match:
+        content = trace[:match.start()].strip()
+        token_usage = {
+            "total_tokens": int(match.group(1)),
+            "input_tokens": int(match.group(2)),
+            "output_tokens": int(match.group(3))
+        }
+        return content, token_usage
+    
+    # 嘗試匹配只有 total tokens 的格式 |tokens:xxx
+    simple_pattern = r'\s*\|tokens:(\d+)\s*$'
+    simple_match = re.search(simple_pattern, trace)
+    if simple_match:
+        content = trace[:simple_match.start()].strip()
+        token_usage = {
+            "total_tokens": int(simple_match.group(1)),
+            "input_tokens": 0,
+            "output_tokens": 0
+        }
+        return content, token_usage
+    
+    return trace, None
+
+
 def build_thinking_process_from_state(state: Dict[str, Any]) -> Optional[AgentThinkingProcess]:
     """從狀態構建思考過程"""
     import time
@@ -672,8 +715,16 @@ def build_thinking_process_from_state(state: Dict[str, Any]) -> Optional[AgentTh
     
     steps: List[AgentThinkingStep] = []
     
-    # Collect reasoning trace
-    reasoning_trace = state.get("reasoning_trace", []) if isinstance(state, dict) else []
+    # Collect reasoning trace and parse token info
+    raw_reasoning_trace = state.get("reasoning_trace", []) if isinstance(state, dict) else []
+    reasoning_trace = []  # 清理後的 reasoning trace（不含 token 標記）
+    trace_token_map = {}  # 索引 -> token_usage 的映射
+    
+    for i, trace in enumerate(raw_reasoning_trace):
+        content, token_usage = parse_token_from_trace(trace)
+        reasoning_trace.append(content)
+        if token_usage:
+            trace_token_map[i] = token_usage
     
     # Collect decision history
     decision_history = state.get("decision_history", []) if isinstance(state, dict) else []
@@ -709,16 +760,29 @@ def build_thinking_process_from_state(state: Dict[str, Any]) -> Optional[AgentTh
         action = current_decision.get("action", "")
         reasoning = current_decision.get("reasoning", "")
         tool_name = current_decision.get("tool_name")
+        
+        # 嘗試從最後一個 reasoning_trace 獲取 token 資訊
+        last_token_usage = None
+        if trace_token_map and len(raw_reasoning_trace) > 0:
+            last_idx = len(raw_reasoning_trace) - 1
+            last_token_usage = trace_token_map.get(last_idx)
+        
+        decision_metadata = {
+            "action": action,
+            "tool_name": tool_name,
+            "reasoning": reasoning,
+            "parameters": current_decision.get("parameters", {})
+        }
+        
+        # 添加 token_usage 到 metadata
+        if last_token_usage:
+            decision_metadata["token_usage"] = last_token_usage
+        
         steps.append(AgentThinkingStep(
             step_type="decision",
             timestamp=start_time + len(decision_history) * 0.1,
             content=f"Action: {action}" + (f" | Tool: {tool_name}" if tool_name else ""),
-            metadata={
-                "action": action,
-                "tool_name": tool_name,
-                "reasoning": reasoning,
-                "parameters": current_decision.get("parameters", {})
-            }
+            metadata=decision_metadata
         ))
     
     # Add tool call steps
@@ -809,6 +873,30 @@ def build_thinking_process_from_state(state: Dict[str, Any]) -> Optional[AgentTh
                     "tool": tool,
                     "iteration": iteration,
                     "error_details": error_details
+                }
+            ))
+    
+    # 為帶有 token 資訊的 reasoning_trace 生成 synthesis 類型步驟
+    # 這些通常對應 synthesize_answer 或 refine_query 的 LLM 調用
+    for i, trace_content in enumerate(reasoning_trace):
+        token_usage = trace_token_map.get(i)
+        if token_usage:
+            # 判斷步驟類型
+            step_type = "synthesis"
+            if "Refined query" in trace_content:
+                step_type = "refinement"
+            elif "Decision:" in trace_content or "Action:" in trace_content:
+                step_type = "decision"
+            elif "Generated answer" in trace_content or "quality score" in trace_content.lower():
+                step_type = "synthesis"
+            
+            steps.append(AgentThinkingStep(
+                step_type=step_type,
+                timestamp=start_time + len(steps) * 0.1,
+                content=trace_content,
+                metadata={
+                    "token_usage": token_usage,
+                    "trace_index": i
                 }
             ))
     
