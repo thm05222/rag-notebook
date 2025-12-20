@@ -4,6 +4,7 @@ Supports iterative search, multi-tool usage, self-evaluation, and hallucination 
 """
 
 import asyncio
+import difflib
 import operator
 import os
 import time
@@ -456,6 +457,51 @@ def _categorize_tool(tool_name: str) -> str:
     else:
         return "other"
 
+
+def calculate_similarity(a: str, b: str) -> float:
+    """計算兩個字串的相似度 (0.0 ~ 1.0)"""
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(
+        None, a.lower().strip(), b.lower().strip()
+    ).ratio()
+
+
+def is_duplicate_decision(
+    current_tool: str,
+    current_query: str,
+    history: list,
+    strict_mode: bool = False,
+) -> bool:
+    """
+    檢查是否為重複決策。
+    
+    Args:
+        current_tool: 當前工具名稱
+        current_query: 當前查詢字串
+        history: 搜尋歷史列表
+        strict_mode: 是否使用嚴格模式
+            - True (Vector Search): 相似度 > 0.8 視為重複（語意相近）
+            - False (Internet Search): 相似度 > 0.95 視為重複（幾乎完全相同才擋）
+    
+    Returns:
+        bool: 如果檢測到重複則返回 True
+    """
+    threshold = 0.8 if strict_mode else 0.95
+
+    for item in history:
+        # 確保比較對象是同一種工具的查詢
+        if item.get("tool") != current_tool:
+            continue
+
+        prev_query = item.get("query", "")
+        similarity = calculate_similarity(current_query, prev_query)
+
+        if similarity > threshold:
+            return True
+    return False
+
+
 async def agent_decision(
     state: ChatAgenticState, config: RunnableConfig
 ) -> Dict[str, Any]:
@@ -762,7 +808,46 @@ async def agent_decision(
             structured=dict(type="json"),
         )
 
-        response = await model.ainvoke(messages_payload)
+        # === [新增] API 連接錯誤重試機制 ===
+        # 對於網絡連接錯誤，進行重試（最多 2 次）
+        max_api_retries = 2
+        api_error = None
+        response = None
+        
+        for api_attempt in range(max_api_retries):
+            try:
+                response = await model.ainvoke(messages_payload)
+                break  # 成功則跳出重試循環
+            except Exception as api_e:
+                api_error = api_e
+                error_str = str(api_e).lower()
+                
+                # 檢查是否為可重試的錯誤（連接錯誤、超時等）
+                is_retryable = (
+                    "connection" in error_str
+                    or "timeout" in error_str
+                    or "refused" in error_str
+                    or "reset" in error_str
+                    or "apiconnectionerror" in error_str
+                )
+                
+                if is_retryable and api_attempt < max_api_retries - 1:
+                    logger.warning(
+                        f"[Iteration {iteration}] API connection error (attempt {api_attempt + 1}/{max_api_retries}): {api_e}"
+                    )
+                    logger.info(f"[Iteration {iteration}] Waiting 2 seconds before retry...")
+                    await asyncio.sleep(2)  # 等待 2 秒後重試
+                else:
+                    # 不可重試的錯誤或已達重試上限，重新拋出
+                    if api_attempt >= max_api_retries - 1:
+                        logger.error(
+                            f"[Iteration {iteration}] API call failed after {max_api_retries} attempts: {api_e}"
+                        )
+                    raise
+        
+        if response is None:
+            # 如果所有重試都失敗
+            raise api_error or Exception("Failed to get response from LLM after retries")
         content = (
             response.content
             if isinstance(response.content, str)
@@ -835,6 +920,70 @@ async def agent_decision(
             f"[Iteration {iteration}] Decision: action={decision.action}, tool={decision.tool_name}, reasoning={decision.reasoning[:100] if decision.reasoning else 'None'}..."
         )
 
+        # === [智慧型去重邏輯開始] ===
+        if decision.action == "use_tool":
+            tool_name = decision.tool_name
+            new_query = decision.parameters.get("query", "") if decision.parameters else ""
+            search_history = state.get("search_history", [])
+
+            # 判斷是否開啟嚴格模式
+            # Vector Search 是語意檢索，相似語句結果相同，故嚴格去重
+            is_strict = tool_name == "vector_search"
+
+            if is_duplicate_decision(tool_name, new_query, search_history, strict_mode=is_strict):
+                logger.warning(
+                    f"[Iteration {iteration}] ⚠️ Smart Deduplication triggered for {tool_name}: '{new_query}'"
+                )
+
+                # 策略: 如果發現重複，自動升級工具或停止
+                if tool_name == "vector_search":
+                    logger.info(
+                        f"[Iteration {iteration}] -> Escalating duplicate local search to Internet Search"
+                    )
+                    decision.tool_name = "internet_search"
+                    # 保留查詢詞，換個地方搜
+                    if decision.parameters:
+                        decision.parameters["query"] = new_query
+                    decision.reasoning = (
+                        f"[System Auto-Correction] Local search query was repetitive. "
+                        f"Switching to Internet Search to find external authoritative sources."
+                    )
+
+                elif tool_name == "internet_search":
+                    # 如果連網絡搜尋都重複了，檢查是否有結果
+                    collected_results = state.get("collected_results", [])
+                    if len(collected_results) == 0:
+                        # 沒有結果且重複搜尋，嘗試簡化查詢或直接報錯
+                        logger.warning(
+                            f"[Iteration {iteration}] -> Internet search repeated with no results, forcing synthesize with error message"
+                        )
+                        decision.action = "synthesize"
+                        decision.reasoning = (
+                            f"[System Auto-Correction] Repeated internet search detected with no results. "
+                            f"Unable to find information. Please try rephrasing your question or check if the information exists."
+                        )
+                    else:
+                        # 有結果但重複搜尋，直接合成
+                        logger.info(
+                            f"[Iteration {iteration}] -> Stopping repetitive internet search, synthesizing available results"
+                        )
+                        decision.action = "synthesize"
+                        decision.reasoning = (
+                            f"[System Auto-Correction] Repeated internet search detected. "
+                            f"Synthesizing current information ({len(collected_results)} items collected)."
+                        )
+                else:
+                    # 其他工具重複，強制合成
+                    logger.info(
+                        f"[Iteration {iteration}] -> Stopping repetitive {tool_name} usage, forcing synthesize"
+                    )
+                    decision.action = "synthesize"
+                    decision.reasoning = (
+                        f"[System Auto-Correction] Repeated {tool_name} usage detected. "
+                        f"Stopping to synthesize available information."
+                    )
+        # === [智慧型去重邏輯結束] ===
+
         # Update token count (estimate response tokens)
         new_token_count += 500  # Estimate
 
@@ -895,10 +1044,109 @@ async def agent_decision(
         return result
     except Exception as e:
         logger.error(f"Error in agent decision: {e}")
+        logger.exception(e)  # 記錄完整堆疊追蹤
+        
+        # === [修復] 改進的 Fallback 機制 ===
+        # 關鍵問題：之前的邏輯在 Iteration 0 時如果有 collected_results（殘留數據），
+        # 會直接 synthesize，導致 Agent 完全跳過搜索步驟。
+        # 
+        # 修復策略：
+        # 1. 檢查 search_history 來判斷是否真的執行過搜索
+        # 2. 只有在 iteration >= 2 且 search_history 不為空且有結果時，才 synthesize
+        # 3. 否則強制執行搜索工具
+        
+        collected_results = state.get("collected_results", [])
+        search_history = state.get("search_history", [])
+        question = state.get("question", "")
+        
+        # 過濾掉錯誤結果，只計算有效結果
+        valid_results = [r for r in collected_results if r.get("type") != "error"]
+        
+        # 判斷是否應該 synthesize：
+        # 條件：iteration >= 2 且 search_history 不為空（說明真的執行過搜索）且有有效結果
+        should_synthesize = (
+            iteration >= 2 
+            and len(search_history) > 0 
+            and len(valid_results) > 0
+        )
+        
+        if should_synthesize:
+            logger.info(
+                f"[Iteration {iteration}] Decision failed but have valid search results "
+                f"(search_history={len(search_history)}, valid_results={len(valid_results)}), fallback to synthesize."
+            )
+            fallback_decision = {
+                "action": "synthesize",
+                "tool_name": None,
+                "parameters": {},
+                "reasoning": f"Decision system encountered an error. Synthesizing based on {len(valid_results)} collected results from {len(search_history)} previous searches.",
+            }
+        else:
+            # 強制執行搜索：智慧選擇工具
+            # 這確保 Agent 在 Iteration 0 時不會跳過搜索步驟
+            logger.info(
+                f"[Iteration {iteration}] Decision failed, forcing search execution. "
+                f"(search_history={len(search_history)}, valid_results={len(valid_results)})"
+            )
+            
+            # 分析搜索歷史
+            local_search_attempted = any(
+                s.get("tool") in ["vector_search", "pageindex_search", "text_search"] 
+                for s in search_history
+            )
+            internet_search_attempted = any(
+                s.get("tool") == "internet_search" 
+                for s in search_history
+            )
+            
+            # 計算各類搜索的成功率
+            local_search_success = sum(
+                1 for s in search_history 
+                if s.get("tool") in ["vector_search", "pageindex_search", "text_search"] 
+                and s.get("result_count", 0) > 0
+            )
+            
+            # === [增強] 智慧工具選擇邏輯 ===
+            # 1. 如果本地和網絡搜索都已嘗試，強制 synthesize（避免無限循環）
+            if local_search_attempted and internet_search_attempted:
+                logger.info(
+                    f"[Iteration {iteration}] Both local and internet search attempted, forcing synthesize."
+                )
+                fallback_decision = {
+                    "action": "synthesize",
+                    "tool_name": None,
+                    "parameters": {},
+                    "reasoning": "System recovery: both local and internet search have been attempted. Synthesizing with available information.",
+                }
+            # 2. 如果還沒有嘗試過本地搜索，優先使用 vector_search
+            elif not local_search_attempted:
+                fallback_decision = {
+                    "action": "use_tool",
+                    "tool_name": "vector_search",
+                    "parameters": {"query": question, "limit": 10},
+                    "reasoning": "System recovery: attempting local vector search due to decision error.",
+                }
+            # 3. 如果本地搜索已嘗試但無結果，使用 internet_search
+            elif not internet_search_attempted:
+                fallback_decision = {
+                    "action": "use_tool",
+                    "tool_name": "internet_search",
+                    "parameters": {"query": question},
+                    "reasoning": "System recovery: attempting internet search due to decision error (local search already attempted).",
+                }
+            # 4. 其他情況（所有搜索都已嘗試），強制 synthesize
+            else:
+                fallback_decision = {
+                    "action": "synthesize",
+                    "tool_name": None,
+                    "parameters": {},
+                    "reasoning": "System recovery: all search methods exhausted, synthesizing with current information.",
+                }
+
         # 關鍵修復：error_history 和 reasoning_trace 使用 operator.add
         # 只返回新元素，LangGraph 會自動累積
-
         return {
+            "current_decision": fallback_decision,  # 關鍵修復：設置 fallback 決策
             "error_history": [
                 {
                     "step": "agent_decision",
@@ -906,7 +1154,8 @@ async def agent_decision(
                     "iteration": state["iteration_count"],
                 }
             ],  # 只返回新元素
-            "reasoning_trace": [f"Decision failed: {str(e)}"],  # 只返回新元素
+            "reasoning_trace": [f"Decision failed: {str(e)}, fallback to {fallback_decision.get('tool_name', 'synthesize')}"],  # 只返回新元素
+            "decision_history": ["error_recovery"],  # 記錄錯誤恢復決策
         }
 
 
@@ -1349,19 +1598,52 @@ async def execute_tool(
 
         # 如果工具執行失敗，將錯誤信息作為結果返回
         if not result.get("success"):
+            error_msg = result.get("error", "未知錯誤")
             error_result = {
                 "id": f"error_{tool_name}_{int(time.time())}",
                 "type": "error",
                 "title": f"工具執行失敗: {tool_name}",
-                "content": result.get("error", "未知錯誤"),
+                "content": error_msg,
                 "error_details": result.get("error_details", {}),
                 "tool_name": tool_name,
                 "query": parameters.get("query", ""),
             }
 
             # 更新 search_entry 以包含錯誤信息
-            search_entry["error"] = result.get("error")
+            search_entry["error"] = error_msg
             search_entry["error_details"] = result.get("error_details", {})
+
+            # === [新增] 智慧型錯誤處理：自動禁用無效工具 ===
+            unavailable_tools = state.get("unavailable_tools", [])
+            should_ban_tool = False
+            
+            # 檢查是否為結構性錯誤（重試也無效的錯誤）
+            error_msg_lower = error_msg.lower()
+            if (
+                "pageindex structure" in error_msg_lower
+                or "not supported" in error_msg_lower
+                or "structure not found" in error_msg_lower
+                or "no pageindex" in error_msg_lower
+                or "pageindex is not available" in error_msg_lower
+            ):
+                should_ban_tool = True
+                logger.info(
+                    f"[Iteration {iteration}] Auto-banning tool {tool_name} due to structural error: {error_msg[:100]}"
+                )
+            
+            # 如果是明確的工具不存在錯誤
+            if "tool not found" in error_msg_lower or "does not exist" in error_msg_lower:
+                should_ban_tool = True
+                logger.info(
+                    f"[Iteration {iteration}] Auto-banning tool {tool_name} due to tool not found error"
+                )
+            
+            if should_ban_tool and tool_name not in unavailable_tools:
+                unavailable_tools = unavailable_tools + [tool_name]  # 使用列表連接，因為 operator.add
+                logger.warning(
+                    f"[Iteration {iteration}] Tool {tool_name} has been added to unavailable_tools list. "
+                    f"Future attempts to use this tool will be automatically filtered."
+                )
 
             # 關鍵修復：只返回錯誤結果，利用 operator.add 自動累積
             return {
@@ -1372,12 +1654,13 @@ async def execute_tool(
                 "error_history": [
                     {  # 只返回新元素，LangGraph 會自動累積
                         "step": "execute_tool",
-                        "error": result.get("error", "工具執行失敗"),
+                        "error": error_msg,
                         "tool": tool_name,
                         "iteration": state["iteration_count"],
                         "error_details": result.get("error_details", {}),
                     }
                 ],
+                "unavailable_tools": unavailable_tools if should_ban_tool else [],  # 只返回新元素
             }
 
         # Collect results if successful
@@ -1949,9 +2232,42 @@ async def synthesize_answer(
         f"[Iteration {iteration}] synthesize_answer: Starting synthesis. Collected results: {collected_results_count}, max_iterations: {max_iterations}"
     )
 
+    # === [新增] 限制上下文長度，防止 LLM 返回空值 ===
+    collected_results = state.get("collected_results", [])
+    
+    # 如果結果超過 10 個，進行去重和限制
+    if len(collected_results) > 10:
+        # 簡單去重：基於內容片段
+        unique_results = []
+        seen_content = set()
+        for res in collected_results:
+            # 跳過錯誤結果
+            if res.get("type") == "error":
+                continue
+            # 使用內容的前 50 個字符作為去重鍵
+            content_snippet = (res.get("content", "") or res.get("text", "") or res.get("summary", ""))[:50]
+            if content_snippet and content_snippet not in seen_content:
+                unique_results.append(res)
+                seen_content.add(content_snippet)
+            elif not content_snippet:
+                # 如果沒有內容片段，使用 ID 去重
+                res_id = res.get("id", "")
+                if res_id and res_id not in seen_content:
+                    unique_results.append(res)
+                    seen_content.add(res_id)
+        
+        # 取前 10 個最相關的結果傳給 LLM
+        limited_results = unique_results[:10]
+        logger.info(
+            f"[Iteration {iteration}] synthesize_answer: Filtering results from {len(collected_results)} to {len(limited_results)} "
+            f"(removed {len(collected_results) - len(limited_results)} duplicates/excess items)"
+        )
+    else:
+        limited_results = collected_results
+    
     prompt_data = {
         "question": state["question"],
-        "collected_results": state["collected_results"],
+        "collected_results": limited_results,  # 使用限制後的結果
         # 移除 conversation_context，現在使用原生 Messages 格式
     }
 
@@ -2230,13 +2546,12 @@ async def synthesize_answer(
                 f"[Iteration {iteration}] synthesize_answer: Answer rejected, generating feedback for Orchestrator"
             )
             
-            # [關鍵修復] 即使答案被 reject，也要添加 AI 消息到 messages
-            # 這樣當 should_accept_answer 強制接受時，消息會被保存
-            from langchain_core.messages import AIMessage
-            ai_message = AIMessage(content=answer)
+            # [修復] 當答案被 reject 時，不添加 AI 消息到 messages
+            # 這樣可以避免重複的 AI messages
+            # AI 消息只在 final_answer 被設置時添加
             
             return {
-                "messages": [ai_message],  # [關鍵修復] 添加 AI 消息，以便強制接受時能保存
+                # [修復] 移除 "messages": [ai_message]，避免重複
                 "partial_answer": answer,
                 "final_answer": None,  # 不設為最終答案
                 "hallucination_check": hallucination_check,

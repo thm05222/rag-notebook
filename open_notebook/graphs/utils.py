@@ -36,8 +36,10 @@ async def provision_langchain_model(
         
         # Check role-specific model configuration (required, no fallback)
         role_models = defaults.role_default_models or {}
-        logger.debug(f"Looking up model for role '{default_type}', available role_models: {role_models}")
+        logger.info(f"[MODEL DEBUG] model_id is None, looking up default for role '{default_type}'")
+        logger.info(f"[MODEL DEBUG] Available role_models: {role_models}")
         direct_model_id = role_models.get(default_type)
+        logger.info(f"[MODEL DEBUG] Found default model for '{default_type}': {direct_model_id}")
         
         if not direct_model_id:
             # Check all required roles and return list of missing ones

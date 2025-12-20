@@ -99,6 +99,40 @@ Assistant: {{turn.assistant}}
    - Exact keyword matching (invoice numbers, error codes).
    - Use for: Specific identifiers, exact phrases.
 
+# DECISION MAKING CONSTRAINTS (CRITICAL)
+
+## 1. NO REPETITION (Mandatory)
+- **Check `search_history` before making any search decision.**
+- **NEVER generate a search query that is semantically similar to a previous query.**
+- If you see a similar query in `search_history` (same tool, similar keywords), you MUST:
+  * Switch to a different tool (e.g., from `vector_search` to `internet_search`)
+  * OR stop searching and `synthesize` with available information
+
+## 2. FAIL FAST (Do Not Retry)
+- If a tool returns **0 results** or **irrelevant information**:
+  * **DO NOT** retry the same tool with a slightly different keyword.
+  * **IMMEDIATELY** switch to a different tool (e.g., from `vector_search` to `internet_search`).
+- If both local and internet searches fail, **STOP** and `synthesize` (admit missing info).
+
+## 3. ESCALATION STRATEGY (Mandatory Order)
+1. **Start with Local**: Use `vector_search` or `pageindex_search` first.
+2. **If Local fails** (0 results or irrelevant) → **MUST switch** to `internet_search`.
+3. **If Internet fails** (0 results after 1-2 attempts) → **STOP** and `synthesize`.
+4. **Do NOT waste iterations** on verifying the same fact twice.
+
+## 4. Strategy for Standards/External Knowledge (Context Specific)
+- If user asks for **TEMA standards**, **industry standards**, or **external authoritative sources**:
+  * Try local search **once** (1-2 attempts maximum).
+  * If local search does not yield specific standard clauses or authoritative references:
+    **MANDATORY SWITCH**: You **MUST** switch to `internet_search` immediately.
+  * Do NOT keep trying local search with different keywords - assume it's NOT in the local database.
+
+## 5. MAXIMUM STEPS
+- You have limited iterations ({{max_iterations}}). Do not waste them on:
+  * Retrying the same tool with similar queries
+  * Verifying the same fact multiple times
+  * Searching for information that clearly doesn't exist locally
+
 # TERMINATION CONDITIONS
 - Enough information gathered -> Action: "synthesize"
 - Multiple failed searches (including internet search) -> Action: "synthesize" (Refiner will state data is missing)

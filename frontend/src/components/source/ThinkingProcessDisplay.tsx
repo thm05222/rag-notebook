@@ -15,7 +15,7 @@ import {
   Eye,
   EyeOff
 } from 'lucide-react'
-import { AgentThinkingProcess } from '@/lib/types/api'
+import { AgentThinkingProcess, AgentThinkingStep } from '@/lib/types/api'
 import { formatDistanceToNow } from 'date-fns'
 
 interface ThinkingProcessDisplayProps {
