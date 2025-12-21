@@ -13,9 +13,12 @@ export function useAuth() {
     logout,
     checkAuth,
     checkAuthRequired,
+    clearError,
     error,
     hasHydrated,
-    authRequired
+    authRequired,
+    authMode,
+    turnstileEnabled,
   } = useAuthStore()
 
   useEffect(() => {
@@ -28,6 +31,8 @@ export function useAuth() {
           if (required) {
             checkAuth()
           }
+        }).catch(() => {
+          // Error handled in store
         })
       } else if (authRequired) {
         // Auth is required, check credentials
@@ -38,8 +43,8 @@ export function useAuth() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasHydrated, authRequired])
 
-  const handleLogin = async (password: string) => {
-    const success = await login(password)
+  const handleLogin = async (username: string, password: string, captchaToken?: string) => {
+    const success = await login(username, password, captchaToken)
     if (success) {
       // Check if there's a stored redirect path
       const redirectPath = sessionStorage.getItem('redirectAfterLogin')
@@ -62,7 +67,10 @@ export function useAuth() {
     isAuthenticated,
     isLoading: isLoading || !hasHydrated, // Treat lack of hydration as loading
     error,
+    authMode,
+    turnstileEnabled,
     login: handleLogin,
-    logout: handleLogout
+    logout: handleLogout,
+    clearError,
   }
 }

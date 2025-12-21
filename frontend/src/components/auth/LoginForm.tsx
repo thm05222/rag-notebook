@@ -1,23 +1,43 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { useAuth } from '@/lib/hooks/use-auth'
+import { Turnstile, TurnstileInstance } from 'react-turnstile'
 import { useAuthStore } from '@/lib/stores/auth-store'
 import { getConfig } from '@/lib/config'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { AlertCircle } from 'lucide-react'
+import { AlertCircle, Loader2 } from 'lucide-react'
 import { LoadingSpinner } from '@/components/common/LoadingSpinner'
 
 export function LoginForm() {
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
-  const { login, isLoading, error } = useAuth()
-  const { authRequired, checkAuthRequired, hasHydrated, isAuthenticated } = useAuthStore()
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null)
+  const [captchaError, setCaptchaError] = useState<string | null>(null)
+  const turnstileRef = useRef<TurnstileInstance>(null)
+  
+  const { 
+    login, 
+    isLoading, 
+    error, 
+    authRequired, 
+    authMode,
+    turnstileEnabled,
+    checkAuthRequired, 
+    hasHydrated, 
+    isAuthenticated,
+    clearError
+  } = useAuthStore()
+  
   const [isCheckingAuth, setIsCheckingAuth] = useState(true)
   const [configInfo, setConfigInfo] = useState<{ apiUrl: string; version: string; buildTime: string } | null>(null)
   const router = useRouter()
+
+  // Get Turnstile site key from environment
+  const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || ''
 
   // Load config info for debugging
   useEffect(() => {
@@ -65,6 +85,14 @@ export function LoginForm() {
       void checkAuth()
     }
   }, [hasHydrated, authRequired, checkAuthRequired, router, isAuthenticated])
+
+  // Clear error when form changes
+  useEffect(() => {
+    if (error) {
+      clearError()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [username, password])
 
   // Show loading while checking if auth is required
   if (!hasHydrated || isCheckingAuth) {
@@ -125,14 +153,79 @@ export function LoginForm() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (password.trim()) {
-      try {
-        await login(password)
-      } catch (error) {
-        console.error('Unhandled error during login:', error)
-        // The auth store should handle most errors, but this catches any unhandled ones
+    
+    // Validate form
+    if (authMode === 'jwt') {
+      if (!username.trim() || !password.trim()) {
+        return
+      }
+      
+      // Check captcha if required
+      if (turnstileEnabled && !captchaToken) {
+        setCaptchaError('Please complete the captcha verification')
+        return
+      }
+    } else {
+      // Legacy mode only needs password
+      if (!password.trim()) {
+        return
       }
     }
+    
+    setCaptchaError(null)
+    
+    try {
+      const success = await login(
+        authMode === 'jwt' ? username : 'admin',
+        password,
+        captchaToken || undefined
+      )
+      
+      if (success) {
+        router.push('/notebooks')
+      } else {
+        // Reset captcha on failure
+        if (turnstileRef.current) {
+          turnstileRef.current.reset()
+          setCaptchaToken(null)
+        }
+      }
+    } catch (error) {
+      console.error('Unhandled error during login:', error)
+      // Reset captcha on error
+      if (turnstileRef.current) {
+        turnstileRef.current.reset()
+        setCaptchaToken(null)
+      }
+    }
+  }
+
+  const handleCaptchaVerify = (token: string) => {
+    setCaptchaToken(token)
+    setCaptchaError(null)
+  }
+
+  const handleCaptchaError = () => {
+    setCaptchaToken(null)
+    setCaptchaError('Captcha verification failed. Please try again.')
+  }
+
+  const handleCaptchaExpire = () => {
+    setCaptchaToken(null)
+  }
+
+  // Determine if submit button should be disabled
+  const isSubmitDisabled = () => {
+    if (isLoading) return true
+    
+    if (authMode === 'jwt') {
+      if (!username.trim() || !password.trim()) return true
+      if (turnstileEnabled && !captchaToken) return true
+    } else {
+      if (!password.trim()) return true
+    }
+    
+    return false
   }
 
   return (
@@ -141,21 +234,67 @@ export function LoginForm() {
         <CardHeader className="text-center">
           <CardTitle>RAG Notebook</CardTitle>
           <CardDescription>
-            Enter your password to access the application
+            {authMode === 'jwt' 
+              ? 'Sign in to access the application'
+              : 'Enter your password to access the application'
+            }
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
+            {/* Username field - only for JWT mode */}
+            {authMode === 'jwt' && (
+              <div className="space-y-2">
+                <Label htmlFor="username">Username</Label>
+                <Input
+                  id="username"
+                  type="text"
+                  placeholder="Enter username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  disabled={isLoading}
+                  autoComplete="username"
+                />
+              </div>
+            )}
+
+            {/* Password field */}
+            <div className="space-y-2">
+              <Label htmlFor="password">Password</Label>
               <Input
+                id="password"
                 type="password"
-                placeholder="Password"
+                placeholder="Enter password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 disabled={isLoading}
+                autoComplete="current-password"
               />
             </div>
 
+            {/* Turnstile captcha - only if enabled */}
+            {authMode === 'jwt' && turnstileEnabled && turnstileSiteKey && (
+              <div className="space-y-2">
+                <div className="flex justify-center">
+                  <Turnstile
+                    ref={turnstileRef}
+                    sitekey={turnstileSiteKey}
+                    onVerify={handleCaptchaVerify}
+                    onError={handleCaptchaError}
+                    onExpire={handleCaptchaExpire}
+                    theme="auto"
+                  />
+                </div>
+                {captchaError && (
+                  <div className="flex items-center justify-center gap-2 text-red-600 text-sm">
+                    <AlertCircle className="h-4 w-4" />
+                    {captchaError}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Error message */}
             {error && (
               <div className="flex items-center gap-2 text-red-600 text-sm">
                 <AlertCircle className="h-4 w-4" />
@@ -163,14 +302,23 @@ export function LoginForm() {
               </div>
             )}
 
+            {/* Submit button */}
             <Button
               type="submit"
               className="w-full"
-              disabled={isLoading || !password.trim()}
+              disabled={isSubmitDisabled()}
             >
-              {isLoading ? 'Signing in...' : 'Sign In'}
+              {isLoading ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Signing in...
+                </>
+              ) : (
+                'Sign In'
+              )}
             </Button>
 
+            {/* Version info */}
             {configInfo && (
               <div className="text-xs text-center text-muted-foreground pt-2 border-t">
                 <div>Version {configInfo.version}</div>

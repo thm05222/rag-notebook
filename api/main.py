@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
-from api.auth import PasswordAuthMiddleware
+from api.auth import AuthMiddleware
 from api.middleware.idempotency import IdempotencyMiddleware
 from api.routers import (
     auth,
@@ -287,9 +287,21 @@ app = FastAPI(
 # Add idempotency middleware (before authentication)
 app.add_middleware(IdempotencyMiddleware)
 
-# Add password authentication middleware
-# Exclude /api/auth/status and /api/config from authentication
-app.add_middleware(PasswordAuthMiddleware, excluded_paths=["/", "/health", "/docs", "/openapi.json", "/redoc", "/api/auth/status", "/api/config"])
+# Add authentication middleware (supports both JWT and legacy password modes)
+# Exclude public paths from authentication
+app.add_middleware(
+    AuthMiddleware,
+    excluded_paths=[
+        "/",
+        "/health",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+        "/api/auth/status",
+        "/api/auth/login",
+        "/api/config",
+    ]
+)
 
 # Add CORS middleware last (so it processes first)
 # Configure CORS from environment variable

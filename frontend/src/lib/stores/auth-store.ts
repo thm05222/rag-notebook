@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { getApiUrl } from '@/lib/config'
+import type { AuthStatusResponse, LoginResponse } from '@/lib/types/auth'
 
 interface AuthState {
   isAuthenticated: boolean
@@ -11,11 +12,14 @@ interface AuthState {
   isCheckingAuth: boolean
   hasHydrated: boolean
   authRequired: boolean | null
+  authMode: 'jwt' | 'legacy' | 'none'
+  turnstileEnabled: boolean
   setHasHydrated: (state: boolean) => void
   checkAuthRequired: () => Promise<boolean>
-  login: (password: string) => Promise<boolean>
+  login: (username: string, password: string, captchaToken?: string) => Promise<boolean>
   logout: () => void
   checkAuth: () => Promise<boolean>
+  clearError: () => void
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -29,9 +33,15 @@ export const useAuthStore = create<AuthState>()(
       isCheckingAuth: false,
       hasHydrated: false,
       authRequired: null,
+      authMode: 'none',
+      turnstileEnabled: false,
 
       setHasHydrated: (state: boolean) => {
         set({ hasHydrated: state })
+      },
+
+      clearError: () => {
+        set({ error: null })
       },
 
       checkAuthRequired: async () => {
@@ -49,9 +59,14 @@ export const useAuthStore = create<AuthState>()(
             throw new Error(`Auth status check failed: ${response.status}`)
           }
 
-          const data = await response.json()
+          const data: AuthStatusResponse = await response.json()
           const required = data.auth_enabled || false
-          set({ authRequired: required })
+          
+          set({ 
+            authRequired: required,
+            authMode: data.auth_mode || 'none',
+            turnstileEnabled: data.turnstile_enabled || false,
+          })
 
           // If auth is not required, mark as authenticated
           if (!required) {
@@ -78,52 +93,121 @@ export const useAuthStore = create<AuthState>()(
         }
       },
 
-      login: async (password: string) => {
+      login: async (username: string, password: string, captchaToken?: string) => {
         set({ isLoading: true, error: null })
+        
+        const { authMode } = get()
+        
         try {
           const apiUrl = await getApiUrl()
-          // Use relative path if apiUrl is empty (Tailscale) or localhost:5055 (Next.js rewrites will proxy)
-          const notebooksUrl = (apiUrl === '' || apiUrl === 'http://localhost:5055') 
-            ? '/api/notebooks' 
-            : `${apiUrl}/api/notebooks`
-
-          // Test auth with notebooks endpoint
-          const response = await fetch(notebooksUrl, {
-            method: 'GET',
-            headers: {
-              'Authorization': `Bearer ${password}`,
-              'Content-Type': 'application/json'
-            }
-          })
           
-          if (response.ok) {
-            set({ 
-              isAuthenticated: true, 
-              token: password, 
-              isLoading: false,
-              lastAuthCheck: Date.now(),
-              error: null
-            })
-            return true
-          } else {
-            let errorMessage = 'Authentication failed'
-            if (response.status === 401) {
-              errorMessage = 'Invalid password. Please try again.'
-            } else if (response.status === 403) {
-              errorMessage = 'Access denied. Please check your credentials.'
-            } else if (response.status >= 500) {
-              errorMessage = 'Server error. Please try again later.'
-            } else {
-              errorMessage = `Authentication failed (${response.status})`
-            }
+          if (authMode === 'jwt') {
+            // JWT authentication - call /api/auth/login
+            const loginUrl = (apiUrl === '' || apiUrl === 'http://localhost:5055') 
+              ? '/api/auth/login' 
+              : `${apiUrl}/api/auth/login`
             
-            set({ 
-              error: errorMessage,
-              isLoading: false,
-              isAuthenticated: false,
-              token: null
+            const response = await fetch(loginUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                username,
+                password,
+                captcha_token: captchaToken || '',
+              }),
             })
-            return false
+            
+            if (response.ok) {
+              const data: LoginResponse = await response.json()
+              set({ 
+                isAuthenticated: true, 
+                token: data.access_token, 
+                isLoading: false,
+                lastAuthCheck: Date.now(),
+                error: null
+              })
+              return true
+            } else {
+              let errorMessage = 'Authentication failed'
+              
+              try {
+                const errorData = await response.json()
+                if (errorData.detail) {
+                  // Map specific error messages to user-friendly ones
+                  if (errorData.detail.includes('Captcha')) {
+                    errorMessage = 'Captcha verification failed. Please try again.'
+                  } else if (errorData.detail.includes('username or password')) {
+                    errorMessage = 'Invalid username or password.'
+                  } else if (errorData.detail.includes('not configured')) {
+                    errorMessage = 'Authentication service is not properly configured.'
+                  } else {
+                    errorMessage = errorData.detail
+                  }
+                }
+              } catch {
+                // Use status code based messages
+                if (response.status === 401) {
+                  errorMessage = 'Invalid username or password.'
+                } else if (response.status === 400) {
+                  errorMessage = 'Invalid request. Please check your input.'
+                } else if (response.status >= 500) {
+                  errorMessage = 'Server error. Please try again later.'
+                }
+              }
+              
+              set({ 
+                error: errorMessage,
+                isLoading: false,
+                isAuthenticated: false,
+                token: null
+              })
+              return false
+            }
+          } else {
+            // Legacy password authentication - test with notebooks endpoint
+            const notebooksUrl = (apiUrl === '' || apiUrl === 'http://localhost:5055') 
+              ? '/api/notebooks' 
+              : `${apiUrl}/api/notebooks`
+
+            const response = await fetch(notebooksUrl, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${password}`,
+                'Content-Type': 'application/json'
+              }
+            })
+            
+            if (response.ok) {
+              set({ 
+                isAuthenticated: true, 
+                token: password, 
+                isLoading: false,
+                lastAuthCheck: Date.now(),
+                error: null
+              })
+              return true
+            } else {
+              let errorMessage = 'Authentication failed'
+              if (response.status === 401) {
+                errorMessage = 'Invalid password. Please try again.'
+              } else if (response.status === 403) {
+                errorMessage = 'Access denied. Please check your credentials.'
+              } else if (response.status >= 500) {
+                errorMessage = 'Server error. Please try again later.'
+              } else {
+                errorMessage = `Authentication failed (${response.status})`
+              }
+              
+              set({ 
+                error: errorMessage,
+                isLoading: false,
+                isAuthenticated: false,
+                token: null
+              })
+              return false
+            }
           }
         } catch (error) {
           console.error('Network error during auth:', error)
@@ -151,13 +235,14 @@ export const useAuthStore = create<AuthState>()(
         set({ 
           isAuthenticated: false, 
           token: null, 
-          error: null 
+          error: null,
+          lastAuthCheck: null,
         })
       },
       
       checkAuth: async () => {
         const state = get()
-        const { token, lastAuthCheck, isCheckingAuth, isAuthenticated } = state
+        const { token, lastAuthCheck, isCheckingAuth, isAuthenticated, authMode } = state
 
         // If already checking, return current auth state
         if (isCheckingAuth) {
@@ -179,7 +264,6 @@ export const useAuthStore = create<AuthState>()(
 
         try {
           const apiUrl = await getApiUrl()
-          // Use relative path if apiUrl is empty (Tailscale) or localhost:5055 (Next.js rewrites will proxy)
           const notebooksUrl = (apiUrl === '' || apiUrl === 'http://localhost:5055') 
             ? '/api/notebooks' 
             : `${apiUrl}/api/notebooks`
@@ -224,7 +308,8 @@ export const useAuthStore = create<AuthState>()(
       name: 'auth-storage',
       partialize: (state) => ({
         token: state.token,
-        isAuthenticated: state.isAuthenticated
+        isAuthenticated: state.isAuthenticated,
+        authMode: state.authMode,
       }),
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true)

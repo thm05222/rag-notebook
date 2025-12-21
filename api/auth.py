@@ -1,26 +1,50 @@
+"""
+Authentication middleware for Open Notebook API.
+Supports both JWT authentication and legacy password authentication for backward compatibility.
+"""
+
 import os
 from typing import Optional
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from api.core.security import decode_access_token, get_auth_mode
 
-class PasswordAuthMiddleware(BaseHTTPMiddleware):
+
+class AuthMiddleware(BaseHTTPMiddleware):
     """
-    Middleware to check password authentication for all API requests.
-    Only active when OPEN_NOTEBOOK_PASSWORD environment variable is set.
+    Unified authentication middleware that supports both JWT and legacy password modes.
+    
+    Authentication Mode Selection:
+    - JWT Mode: If JWT_SECRET_KEY is set, JWT tokens are validated
+    - Legacy Mode: If only OPEN_NOTEBOOK_PASSWORD is set, simple password matching is used
+    - No Auth: If neither is set, all requests are allowed
+    
+    The middleware automatically detects which mode to use based on environment variables.
     """
     
     def __init__(self, app, excluded_paths: Optional[list] = None):
         super().__init__(app)
-        self.password = os.environ.get("OPEN_NOTEBOOK_PASSWORD")
-        self.excluded_paths = excluded_paths or ["/", "/health", "/docs", "/openapi.json", "/redoc"]
+        self.legacy_password = os.environ.get("OPEN_NOTEBOOK_PASSWORD")
+        self.excluded_paths = excluded_paths or [
+            "/",
+            "/health",
+            "/docs",
+            "/openapi.json",
+            "/redoc",
+            "/api/auth/status",
+            "/api/auth/login",
+            "/api/config",
+        ]
     
-    async def dispatch(self, request: Request, call_next):
-        # Skip authentication if no password is set
-        if not self.password:
+    async def dispatch(self, request, call_next):
+        auth_mode = get_auth_mode()
+        
+        # Skip authentication if no auth is configured
+        if auth_mode == "none":
             return await call_next(request)
         
         # Skip authentication for excluded paths
@@ -41,7 +65,7 @@ class PasswordAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"}
             )
         
-        # Expected format: "Bearer {password}"
+        # Parse authorization header
         try:
             scheme, credentials = auth_header.split(" ", 1)
             if scheme.lower() != "bearer":
@@ -53,17 +77,32 @@ class PasswordAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"}
             )
         
-        # Check password
-        if credentials != self.password:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid password"},
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        # Validate credentials based on auth mode
+        if auth_mode == "jwt":
+            # JWT validation
+            token_data = decode_access_token(credentials)
+            if token_data is None:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or expired token"},
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
+        else:
+            # Legacy password validation
+            if credentials != self.legacy_password:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid password"},
+                    headers={"WWW-Authenticate": "Bearer"}
+                )
         
-        # Password is correct, proceed with the request
+        # Authentication successful, proceed with the request
         response = await call_next(request)
         return response
+
+
+# Backward compatibility alias
+PasswordAuthMiddleware = AuthMiddleware
 
 
 # Optional: HTTPBearer security scheme for OpenAPI documentation
@@ -74,11 +113,13 @@ def check_api_password(credentials: Optional[HTTPAuthorizationCredentials] = Non
     """
     Utility function to check API password.
     Can be used as a dependency in individual routes if needed.
-    """
-    password = os.environ.get("OPEN_NOTEBOOK_PASSWORD")
     
-    # No password set, allow access
-    if not password:
+    Note: This function is deprecated. Use api.deps.get_current_user instead.
+    """
+    auth_mode = get_auth_mode()
+    
+    # No auth configured, allow access
+    if auth_mode == "none":
         return True
     
     # No credentials provided
@@ -89,12 +130,23 @@ def check_api_password(credentials: Optional[HTTPAuthorizationCredentials] = Non
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Check password
-    if credentials.credentials != password:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    if auth_mode == "jwt":
+        # JWT validation
+        token_data = decode_access_token(credentials.credentials)
+        if token_data is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    else:
+        # Legacy password validation
+        password = os.environ.get("OPEN_NOTEBOOK_PASSWORD")
+        if credentials.credentials != password:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     
     return True
