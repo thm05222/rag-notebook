@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { Turnstile, TurnstileInstance } from 'react-turnstile'
+import Turnstile, { BoundTurnstileObject } from 'react-turnstile'
 import { useAuthStore } from '@/lib/stores/auth-store'
 import { getConfig } from '@/lib/config'
 import { Button } from '@/components/ui/button'
@@ -17,7 +17,7 @@ export function LoginForm() {
   const [password, setPassword] = useState('')
   const [captchaToken, setCaptchaToken] = useState<string | null>(null)
   const [captchaError, setCaptchaError] = useState<string | null>(null)
-  const turnstileRef = useRef<TurnstileInstance>(null)
+  const turnstileRef = useRef<BoundTurnstileObject | null>(null)
   
   const { 
     login, 
@@ -200,18 +200,23 @@ export function LoginForm() {
     }
   }
 
-  const handleCaptchaVerify = (token: string) => {
+  const handleCaptchaVerify = (token: string, boundTurnstile: BoundTurnstileObject) => {
     setCaptchaToken(token)
     setCaptchaError(null)
+    turnstileRef.current = boundTurnstile
   }
 
-  const handleCaptchaError = () => {
+  const handleCaptchaError = (_error: Error | undefined, boundTurnstile?: BoundTurnstileObject) => {
     setCaptchaToken(null)
     setCaptchaError('Captcha verification failed. Please try again.')
+    if (boundTurnstile) {
+      turnstileRef.current = boundTurnstile
+    }
   }
 
-  const handleCaptchaExpire = () => {
+  const handleCaptchaExpire = (_token: string, boundTurnstile: BoundTurnstileObject) => {
     setCaptchaToken(null)
+    turnstileRef.current = boundTurnstile
   }
 
   // Determine if submit button should be disabled
@@ -277,7 +282,6 @@ export function LoginForm() {
               <div className="space-y-2">
                 <div className="flex justify-center">
                   <Turnstile
-                    ref={turnstileRef}
                     sitekey={turnstileSiteKey}
                     onVerify={handleCaptchaVerify}
                     onError={handleCaptchaError}

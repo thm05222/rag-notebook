@@ -35,6 +35,11 @@ COPY . /app
 
 # Install frontend dependencies and build
 WORKDIR /app/frontend
+
+# Build argument for Turnstile (passed at build time)
+ARG NEXT_PUBLIC_TURNSTILE_SITE_KEY=""
+ENV NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
+
 RUN npm ci
 RUN npm run build
 

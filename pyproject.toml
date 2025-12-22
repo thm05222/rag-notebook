@@ -46,7 +46,8 @@ dependencies = [
     "pytesseract>=0.3.10",  # OCR support for scanned PDFs (using Tesseract, same as content_core)
     "Pillow>=10.0.0",  # Required by pytesseract for image processing
     "python-jose[cryptography]>=3.3.0",  # JWT token handling
-    "passlib[bcrypt]>=1.7.4",  # Password hashing with bcrypt
+    "passlib>=1.7.4",  # Password hashing
+    "bcrypt>=4.0.1,<4.1.0",  # bcrypt backend (pinned for passlib compatibility)
     "python-multipart>=0.0.9",  # Form data parsing for login
 ]
 

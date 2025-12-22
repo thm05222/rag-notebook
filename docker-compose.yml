@@ -69,6 +69,9 @@ services:
         build:
             context: .
             dockerfile: Dockerfile
+            args:
+                # Turnstile site key for frontend build (get from Cloudflare Dashboard)
+                - NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
         ports:
             - "0.0.0.0:8188:8188" # 绑定所有接口，实际会监听在 192.168.0.188（如果已配置）
             - "0.0.0.0:5055:5055"
