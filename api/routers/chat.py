@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableConfig
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from open_notebook.database.repository import ensure_record_id, repo_query
+from open_notebook.database.repository import ensure_record_id, repo_query, repo_add_message, repo_get_chat_history
 from open_notebook.domain.notebook import ChatSession, Notebook, Source
 from open_notebook.exceptions import (
     NotFoundError,
@@ -59,6 +59,7 @@ class ChatMessage(BaseModel):
     content: str = Field(..., description="Message content")
     timestamp: Optional[str] = Field(None, description="Message timestamp")
     thinking_process: Optional[AgentThinkingProcess] = Field(None, description="Agent thinking process (for AI messages)")
+    reasoning_content: Optional[str] = Field(None, description="Plain text reasoning content for simplified display")
 
 
 class ChatSessionResponse(BaseModel):
@@ -306,84 +307,31 @@ async def get_session(session_id: str):
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Get session state from LangGraph to retrieve messages
-        # Note: thread_id should NOT have "chat_session:" prefix to match how messages are stored
-        # (see execute_chat function where thread_id is extracted without prefix)
-        thread_id = session_id.replace("chat_session:", "") if session_id.startswith("chat_session:") else session_id
-        chat_graph = get_graph()
-        thread_state = await chat_graph.aget_state(
-            config=RunnableConfig(configurable={"thread_id": thread_id})
-        )
-
-        # Extract messages from state
+        # === 從 SurrealDB 獲取歷史訊息 ===
+        db_history = await repo_get_chat_history(full_session_id)
         messages: list[ChatMessage] = []
-        state_values = thread_state.values if thread_state and hasattr(thread_state, 'values') else {}
         
-        # [調試] 記錄從 LangGraph 獲取的原始消息數量
-        raw_messages = state_values.get("messages", []) if state_values else []
-        logger.info(f"[DEBUG get_session] thread_id={thread_id}, raw message count: {len(raw_messages)}")
-        for idx, msg in enumerate(raw_messages):
-            msg_type = msg.type if hasattr(msg, "type") else "unknown"
-            msg_content = msg.content[:50] if hasattr(msg, "content") and msg.content else "None"
-            logger.info(f"[DEBUG get_session] Message {idx}: type={msg_type}, preview={msg_content}...")
+        logger.info(f"[PERSISTENCE get_session] Loaded {len(db_history)} messages from SurrealDB for session {full_session_id}")
         
-        # 構建思考過程（如果 state 中有相關數據）
-        thinking_process = build_thinking_process_from_state(state_values) if state_values else None
-        
-        if thread_state and thread_state.values and "messages" in thread_state.values:
-            state_messages = thread_state.values["messages"]
+        for record in db_history:
+            # 還原 thinking_process（如果存在）
+            thinking = None
+            if record.get('thinking_process') and record.get('role') == 'ai':
+                try:
+                    thinking = AgentThinkingProcess(**record['thinking_process'])
+                except Exception as e:
+                    logger.warning(f"Failed to restore thinking_process: {e}")
             
-            # === [修復] 去除重複的 messages ===
-            # 使用 (type, content[:100]) 作為唯一鍵來識別重複
-            seen = set()
-            deduplicated_messages = []
-            for msg in state_messages:
-                msg_type = msg.type if hasattr(msg, "type") else "unknown"
-                msg_content = msg.content[:100] if hasattr(msg, "content") and msg.content else ""
-                key = (msg_type, msg_content)
-                
-                if key not in seen:
-                    seen.add(key)
-                    deduplicated_messages.append(msg)
-                else:
-                    logger.debug(f"[DEDUP get_session] Skipping duplicate: type={msg_type}, content={msg_content[:30]}...")
-            
-            if len(deduplicated_messages) < len(state_messages):
-                logger.info(f"[DEDUP get_session] Removed {len(state_messages) - len(deduplicated_messages)} duplicate messages")
-            
-            state_messages = deduplicated_messages
-            
-            # 找到最後一個 AI 消息的索引
-            last_ai_index = -1
-            for i in range(len(state_messages) - 1, -1, -1):
-                msg = state_messages[i]
-                if hasattr(msg, "type") and msg.type == "ai":
-                    last_ai_index = i
-                    break
-            
-            for idx, msg in enumerate(state_messages):
-                msg_type = msg.type if hasattr(msg, "type") else "unknown"
-                # 只為最後的 AI 消息添加 thinking_process
-                thinking = thinking_process if (msg_type == "ai" and idx == last_ai_index and thinking_process) else None
-                
-                messages.append(
-                    ChatMessage(
-                        id=getattr(msg, "id", f"msg_{len(messages)}"),
-                        type=msg_type,
-                        content=msg.content if hasattr(msg, "content") else str(msg),
-                        timestamp=None,  # LangChain messages don't have timestamps by default
-                        thinking_process=thinking,
-                    )
-                )
+            messages.append(ChatMessage(
+                id=str(record.get('id', f"msg_{len(messages)}")),
+                type="human" if record.get('role') == 'user' else "ai",
+                content=record.get('content', ''),
+                timestamp=str(record.get('created_at')) if record.get('created_at') else None,
+                thinking_process=thinking,
+                reasoning_content=record.get('reasoning_content'),
+            ))
 
         # Find notebook_id (we need to query the relationship)
-        # Ensure session_id has proper table prefix
-        full_session_id = (
-            session_id
-            if session_id.startswith("chat_session:")
-            else f"chat_session:{session_id}"
-        )
-
         notebook_query = await repo_query(
             "SELECT out FROM refers_to WHERE in = $session_id",
             {"session_id": ensure_record_id(full_session_id)},
@@ -398,7 +346,7 @@ async def get_session(session_id: str):
             )
 
         session_model_override = getattr(session, "model_override", None)
-        logger.info(f"[GET SESSION] Returning session {session_id} with model_override={session_model_override}")
+        logger.info(f"[GET SESSION] Returning session {session_id} with model_override={session_model_override}, message_count={len(messages)}")
         
         return ChatSessionWithMessagesResponse(
             id=session.id or "",
@@ -1189,6 +1137,40 @@ async def stream_chat_response(
         except Exception as thinking_error:
             logger.warning(f"stream_chat_response: Failed to build thinking_process: {thinking_error}")
         
+        # === 儲存 AI 回應到 SurrealDB（包含思考過程）===
+        if final_answer and actual_session_id:
+            try:
+                session_id_for_db = (
+                    f"chat_session:{actual_session_id}" 
+                    if not actual_session_id.startswith("chat_session:") 
+                    else actual_session_id
+                )
+                
+                # 將 thinking_process 轉換為 dict 格式存儲
+                thinking_dict = None
+                reasoning_content = None
+                if thinking_process:
+                    thinking_dict = (
+                        thinking_process.model_dump() 
+                        if hasattr(thinking_process, "model_dump") 
+                        else thinking_process.dict() if hasattr(thinking_process, "dict") 
+                        else None
+                    )
+                    # 從 thinking_process 提取 reasoning_trace 作為純文字版思考過程
+                    if thinking_dict and thinking_dict.get('reasoning_trace'):
+                        reasoning_content = "\n".join(thinking_dict['reasoning_trace'])
+                
+                await repo_add_message(
+                    session_id_for_db, 
+                    "ai", 
+                    final_answer, 
+                    thinking_process=thinking_dict,
+                    reasoning_content=reasoning_content
+                )
+                logger.info(f"[PERSISTENCE] Saved AI message to SurrealDB (with thinking_process: {thinking_dict is not None}, reasoning_content: {reasoning_content is not None})")
+            except Exception as e:
+                logger.error(f"[PERSISTENCE] Failed to save AI message: {e}")
+        
         # 發送完成事件（包含實際的 session_id 和 thinking_process，如果會話被自動創建）
         yield build_complete_event(final_answer, actual_session_id, thinking_process)
         
@@ -1392,9 +1374,29 @@ async def execute_chat(request: ExecuteChatRequest):
             )
         )
 
-        # Prepare state for execution
-        state_values = current_state.values if current_state else {}
-        messages = state_values.get("messages", [])
+        # === 從 SurrealDB 獲取歷史對話紀錄 ===
+        from langchain_core.messages import HumanMessage, AIMessage
+        
+        db_history = await repo_get_chat_history(full_session_id)
+        history_messages = []
+        for record in db_history:
+            if record.get('role') == 'user':
+                history_messages.append(HumanMessage(content=record['content']))
+            else:
+                history_messages.append(AIMessage(content=record['content']))
+        
+        logger.info(f"[PERSISTENCE] Loaded {len(db_history)} messages from SurrealDB for session {full_session_id}")
+        
+        # 添加當前用戶訊息
+        user_message = HumanMessage(content=request.message)
+        messages = history_messages + [user_message]
+        
+        # === 立即儲存用戶訊息 ===
+        try:
+            await repo_add_message(full_session_id, "user", request.message)
+            logger.info(f"[PERSISTENCE] Saved user message to SurrealDB")
+        except Exception as e:
+            logger.error(f"[PERSISTENCE] Failed to save user message: {e}")
         
         # Get notebook from session (or use provided notebook_id if session was auto-created)
         notebook_id_from_session = None
@@ -1412,12 +1414,6 @@ async def execute_chat(request: ExecuteChatRequest):
                 notebook = await Notebook.get(notebook_id)
             except Exception as e:
                 logger.warning(f"Could not load notebook {notebook_id}: {e}")
-
-        # Add user message to state
-        from langchain_core.messages import HumanMessage
-
-        user_message = HumanMessage(content=request.message)
-        messages.append(user_message)
 
         # Prepare input for Agentic RAG graph
         # === [修復] 只傳入必要的輸入，讓 initialize_chat_state 處理狀態初始化 ===

@@ -8,7 +8,8 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
-import { Bot, User, Send, Loader2, FileText, Lightbulb, Clock, ChevronDown } from 'lucide-react'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { Bot, User, Send, Loader2, FileText, Lightbulb, Clock, ChevronDown, Brain } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import {
   SourceChatMessage,
@@ -463,6 +464,10 @@ export function ChatPanel({
                           {message.thinking_process && (
                             <ThinkingProcessDisplay thinkingProcess={message.thinking_process} />
                           )}
+                          {/* 純文字版思考過程（從歷史紀錄載入，當沒有完整 thinking_process 時顯示） */}
+                          {!message.thinking_process && message.reasoning_content && (
+                            <ReasoningContentDisplay content={message.reasoning_content} />
+                          )}
                           <MessageActions
                             content={message.content}
                             notebookId={notebookId}
@@ -620,6 +625,57 @@ interface AIMessageContentProps {
   onReferenceClick: (type: string, id: string) => void
   titleMap?: Map<string, string> | Record<string, string>
 }
+
+// Simple component to display plain text reasoning content (from history)
+// Used as a fallback when full thinking_process is not available
+interface ReasoningContentDisplayProps {
+  content: string
+}
+
+const ReasoningContentDisplay = memo(function ReasoningContentDisplay({
+  content
+}: ReasoningContentDisplayProps) {
+  const [isOpen, setIsOpen] = useState(false)
+  
+  if (!content) return null
+  
+  // Split content into lines for display
+  const lines = content.split('\n').filter(line => line.trim())
+  
+  return (
+    <Collapsible open={isOpen} onOpenChange={setIsOpen} className="mt-2">
+      <CollapsibleTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="w-full justify-between text-xs text-muted-foreground hover:text-foreground"
+        >
+          <span className="flex items-center gap-2">
+            <Brain className="h-3 w-3" />
+            Reasoning Process
+            <Badge variant="secondary" className="ml-2">
+              {lines.length} items
+            </Badge>
+          </span>
+          <ChevronDown className={`h-4 w-4 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <Card className="mt-2 border-dashed">
+          <CardContent className="pt-4">
+            <div className="space-y-1">
+              {lines.map((line, index) => (
+                <p key={index} className="text-xs text-muted-foreground">
+                  • {line}
+                </p>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      </CollapsibleContent>
+    </Collapsible>
+  )
+})
 
 const AIMessageContent = memo(function AIMessageContent({
   content,

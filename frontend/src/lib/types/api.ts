@@ -145,6 +145,7 @@ export interface SourceChatMessage {
   content: string
   timestamp?: string
   thinking_process?: AgentThinkingProcess
+  reasoning_content?: string  // 純文字版思考過程（用於簡化顯示）
 }
 
 export interface SourceChatContextIndicator {
@@ -192,6 +193,7 @@ export interface NotebookChatMessage {
   content: string
   timestamp?: string
   thinking_process?: AgentThinkingProcess
+  reasoning_content?: string  // 純文字版思考過程（用於簡化顯示）
 }
 
 export interface NotebookChatSessionWithMessages extends NotebookChatSession {

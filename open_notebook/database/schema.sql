@@ -176,3 +176,19 @@ DEFINE FUNCTION fn::text_search($query_text: string, $match_count: int, $sources
     RETURN (SELECT item_id, math::max(relevance) as relevance from $final_results
         GROUP BY item_id ORDER BY relevance DESC LIMIT $match_count);
 };
+
+-- =============================================================================
+-- MESSAGE TABLE (Chat History Persistence)
+-- =============================================================================
+
+-- Message table for chat history persistence
+DEFINE TABLE message SCHEMAFULL;
+DEFINE FIELD session_id ON TABLE message TYPE record<chat_session>;
+DEFINE FIELD role ON TABLE message TYPE string ASSERT $value INSIDE ["user", "ai"];
+DEFINE FIELD content ON TABLE message TYPE string;
+DEFINE FIELD thinking_process ON TABLE message FLEXIBLE TYPE option<object>;  -- 存儲 AgentThinkingProcess JSON
+DEFINE FIELD reasoning_content ON TABLE message TYPE option<string>;  -- 純文字版思考過程（用於簡化顯示）
+DEFINE FIELD created_at ON TABLE message TYPE datetime DEFAULT time::now();
+
+-- Index for efficient history retrieval
+DEFINE INDEX idx_message_session ON TABLE message COLUMNS session_id;

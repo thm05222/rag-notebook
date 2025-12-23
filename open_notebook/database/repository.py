@@ -41,6 +41,8 @@ __all__ = [
     "repo_insert",
     "parse_record_ids",
     "ensure_record_id",
+    "repo_add_message",
+    "repo_get_chat_history",
 ]
 
 
@@ -287,3 +289,70 @@ async def repo_insert(
             raise DatabaseOperationError(f"Database connection error while inserting record: {str(e)}") from e
         else:
             raise DatabaseOperationError(f"Failed to create record: {str(e)}") from e
+
+
+async def repo_add_message(
+    session_id: str, 
+    role: str, 
+    content: str, 
+    thinking_process: Optional[Dict[str, Any]] = None,
+    reasoning_content: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    儲存單條對話訊息到 SurrealDB
+    
+    Args:
+        session_id: Chat session ID (支援 'chat_session:xxx' 或純 'xxx' 格式)
+        role: 角色 ('user' 或 'ai')
+        content: 訊息內容
+        thinking_process: AI 的思考過程 (AgentThinkingProcess 的 dict 格式)
+        reasoning_content: 純文字版思考過程（用於簡化顯示）
+    """
+    clean_id = session_id.split(":")[-1] if ":" in session_id else session_id
+    
+    sql = """
+    CREATE message SET 
+        session_id = type::thing('chat_session', $session_id),
+        role = $role,
+        content = $content,
+        thinking_process = $thinking_process,
+        reasoning_content = $reasoning_content,
+        created_at = time::now();
+    """
+    try:
+        result = await repo_query(sql, {
+            "session_id": clean_id, 
+            "role": role, 
+            "content": content,
+            "thinking_process": thinking_process,
+            "reasoning_content": reasoning_content
+        })
+        return result[0] if result else {}
+    except Exception as e:
+        logger.error(f"Failed to add message: {e}")
+        raise DatabaseOperationError(f"Failed to add message: {str(e)}") from e
+
+
+async def repo_get_chat_history(session_id: str) -> List[Dict[str, Any]]:
+    """
+    獲取特定 Session 的所有對話紀錄，按時間排序
+    
+    Args:
+        session_id: Chat session ID (支援 'chat_session:xxx' 或純 'xxx' 格式)
+    
+    Returns:
+        List of message dicts with keys: id, session_id, role, content, thinking_process, reasoning_content, created_at
+    """
+    clean_id = session_id.split(":")[-1] if ":" in session_id else session_id
+    
+    sql = """
+    SELECT * FROM message 
+    WHERE session_id = type::thing('chat_session', $session_id)
+    ORDER BY created_at ASC;
+    """
+    try:
+        return await repo_query(sql, {"session_id": clean_id})
+    except Exception as e:
+        logger.error(f"Failed to get chat history: {e}")
+        # Return empty list instead of raising to avoid breaking the chat flow
+        return []
