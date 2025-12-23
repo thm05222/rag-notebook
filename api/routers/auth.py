@@ -16,6 +16,7 @@ from api.core.security import (
     ADMIN_PASSWORD_HASH,
     ADMIN_USERNAME,
     TURNSTILE_SECRET_KEY,
+    TURNSTILE_SITE_KEY,
     create_access_token,
     get_auth_mode,
     get_password_hash,
@@ -45,6 +46,7 @@ class AuthStatusResponse(BaseModel):
     auth_enabled: bool
     auth_mode: str  # "jwt", "legacy", or "none"
     turnstile_enabled: bool
+    turnstile_site_key: str  # Public site key for Turnstile (safe to expose)
     message: str
 
 
@@ -117,6 +119,7 @@ async def get_auth_status():
         auth_enabled=auth_enabled,
         auth_mode=auth_mode,
         turnstile_enabled=turnstile_enabled,
+        turnstile_site_key=TURNSTILE_SITE_KEY if turnstile_enabled else "",
         message=message,
     )
 

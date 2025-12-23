@@ -24,6 +24,7 @@ ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "")
 
 # Turnstile configuration
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "")
+TURNSTILE_SITE_KEY = os.environ.get("NEXT_PUBLIC_TURNSTILE_SITE_KEY", "")
 
 
 class TokenData(BaseModel):

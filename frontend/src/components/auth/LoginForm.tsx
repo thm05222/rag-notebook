@@ -26,6 +26,7 @@ export function LoginForm() {
     authRequired, 
     authMode,
     turnstileEnabled,
+    turnstileSiteKey,
     checkAuthRequired, 
     hasHydrated, 
     isAuthenticated,
@@ -35,9 +36,6 @@ export function LoginForm() {
   const [isCheckingAuth, setIsCheckingAuth] = useState(true)
   const [configInfo, setConfigInfo] = useState<{ apiUrl: string; version: string; buildTime: string } | null>(null)
   const router = useRouter()
-
-  // Get Turnstile site key from environment
-  const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || ''
 
   // Load config info for debugging
   useEffect(() => {

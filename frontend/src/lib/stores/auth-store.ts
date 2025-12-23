@@ -14,6 +14,7 @@ interface AuthState {
   authRequired: boolean | null
   authMode: 'jwt' | 'legacy' | 'none'
   turnstileEnabled: boolean
+  turnstileSiteKey: string
   setHasHydrated: (state: boolean) => void
   checkAuthRequired: () => Promise<boolean>
   login: (username: string, password: string, captchaToken?: string) => Promise<boolean>
@@ -35,6 +36,7 @@ export const useAuthStore = create<AuthState>()(
       authRequired: null,
       authMode: 'none',
       turnstileEnabled: false,
+      turnstileSiteKey: '',
 
       setHasHydrated: (state: boolean) => {
         set({ hasHydrated: state })
@@ -66,6 +68,7 @@ export const useAuthStore = create<AuthState>()(
             authRequired: required,
             authMode: data.auth_mode || 'none',
             turnstileEnabled: data.turnstile_enabled || false,
+            turnstileSiteKey: data.turnstile_site_key || '',
           })
 
           // If auth is not required, mark as authenticated

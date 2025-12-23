@@ -27,6 +27,7 @@ export interface AuthStatusResponse {
   auth_enabled: boolean
   auth_mode: 'jwt' | 'legacy' | 'none'
   turnstile_enabled: boolean
+  turnstile_site_key: string
   message: string
 }
 
